@@ -20,22 +20,31 @@
 #    ↓
 # /correct-text
 #    ↓
-# FLAN-T5-small
+# FLAN-T5-small (lazy loaded)
 #
-# Designed for:
-#   - CPU deployment
+# Optimized for:
 #   - Render
-#   - FastAPI
-#   - PyTorch
-#   - MediaPipe
-#   - FLAN-T5-small
+#   - CPU-only deployment
+#   - Low RAM environments
+#   - Low persistent storage
+#   - Fast startup
 #
 # ============================================================
 
 import asyncio
+import gc
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
+
+# ------------------------------------------------------------
+# Hugging Face cache
+# ------------------------------------------------------------
+# Keep downloaded HF files in a temporary/runtime directory.
+# This avoids filling the application filesystem unnecessarily.
+os.environ.setdefault("HF_HOME", "/tmp/huggingface")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/huggingface/transformers")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import cv2
 import mediapipe as mp
@@ -51,55 +60,68 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 
 # ============================================================
+# PERFORMANCE / MEMORY SETTINGS
+# ============================================================
+
+# Render CPU instances usually have limited memory.
+# Restricting PyTorch threads prevents excessive RAM usage.
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 
 APP_NAME = "Kaitexy AI Sign Language Backend"
-APP_VERSION = "6.0"
+APP_VERSION = "6.1"
 
-# ------------------------------------------------------------
-# Paths
-# ------------------------------------------------------------
+
+# ============================================================
+# PATHS
+# ============================================================
 
 MODEL_PATH = os.getenv(
     "SIGN_MODEL_PATH",
     "model/sign_model.pt"
 )
 
-# ------------------------------------------------------------
-# Sign model
-# ------------------------------------------------------------
+
+# ============================================================
+# SIGN MODEL CONFIGURATION
+# ============================================================
 
 INPUT_SIZE = 63
 
 # IMPORTANT:
 # These labels MUST match the exact class ordering used
-# during training of sign_model.pt.
-#
-# If your model was trained with a different ordering,
-# replace this list with the training order.
-#
+# when sign_model.pt was trained.
 LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 NUM_CLASSES = len(LABELS)
 
-# Minimum confidence required before accepting a prediction.
-#
-# This should ideally be tuned using your validation dataset.
 CONFIDENCE_THRESHOLD = float(
-    os.getenv("CONFIDENCE_THRESHOLD", "0.60")
+    os.getenv(
+        "CONFIDENCE_THRESHOLD",
+        "0.60"
+    )
 )
 
-# ------------------------------------------------------------
-# Image processing
-# ------------------------------------------------------------
+
+# ============================================================
+# IMAGE CONFIGURATION
+# ============================================================
 
 IMAGE_WIDTH = 160
 IMAGE_HEIGHT = 120
 
-# ------------------------------------------------------------
-# MediaPipe
-# ------------------------------------------------------------
+
+# ============================================================
+# MEDIAPIPE CONFIGURATION
+# ============================================================
 
 MAX_NUM_HANDS = 1
 MODEL_COMPLEXITY = 0
@@ -107,9 +129,10 @@ MODEL_COMPLEXITY = 0
 MIN_DETECTION_CONFIDENCE = 0.5
 MIN_TRACKING_CONFIDENCE = 0.5
 
-# ------------------------------------------------------------
-# FLAN-T5
-# ------------------------------------------------------------
+
+# ============================================================
+# FLAN-T5 CONFIGURATION
+# ============================================================
 
 FLAN_MODEL_NAME = os.getenv(
     "FLAN_MODEL_NAME",
@@ -117,11 +140,19 @@ FLAN_MODEL_NAME = os.getenv(
 )
 
 FLAN_MAX_NEW_TOKENS = 40
-FLAN_NUM_BEAMS = 2
+FLAN_NUM_BEAMS = 1
 
-# ------------------------------------------------------------
-# Device
-# ------------------------------------------------------------
+# If True, FLAN-T5 is removed from RAM after every correction.
+# This saves RAM but makes the next correction slower.
+UNLOAD_FLAN_AFTER_REQUEST = os.getenv(
+    "UNLOAD_FLAN_AFTER_REQUEST",
+    "true"
+).lower() == "true"
+
+
+# ============================================================
+# DEVICE
+# ============================================================
 
 DEVICE = torch.device("cpu")
 
@@ -131,12 +162,17 @@ DEVICE = torch.device("cpu")
 # ============================================================
 
 sign_model: Optional[nn.Module] = None
+
 flan_tokenizer = None
 flan_model = None
+
 hands = None
 
 SIGN_MODEL_READY = False
 FLAN_READY = False
+
+# Prevent multiple requests from loading FLAN-T5 simultaneously.
+flan_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -145,15 +181,18 @@ FLAN_READY = False
 
 class SignModel(nn.Module):
     """
-    Neural network architecture used by the trained
-    sign_model.pt.
+    Neural network architecture used during training.
 
     IMPORTANT:
-    This architecture must EXACTLY match the architecture
-    used during training.
+    This architecture MUST exactly match the architecture
+    used to create sign_model.pt.
     """
 
-    def __init__(self, input_size: int, num_classes: int):
+    def __init__(
+        self,
+        input_size: int,
+        num_classes: int
+    ):
         super().__init__()
 
         self.model = nn.Sequential(
@@ -186,33 +225,54 @@ class SignModel(nn.Module):
 # ============================================================
 
 def load_sign_model() -> bool:
-    """
-    Load the trained PyTorch sign classifier safely.
-    """
 
     global sign_model
     global SIGN_MODEL_READY
 
     try:
+
         if not os.path.isfile(MODEL_PATH):
-            print(f"Sign model not found: {MODEL_PATH}")
+
+            print(
+                f"Sign model not found: {MODEL_PATH}"
+            )
+
             SIGN_MODEL_READY = False
             return False
 
-        print(f"Loading sign model: {MODEL_PATH}")
+        print(
+            f"Loading sign model: {MODEL_PATH}"
+        )
 
         model = SignModel(
             input_size=INPUT_SIZE,
             num_classes=NUM_CLASSES
         )
 
-        state_dict = torch.load(
-            MODEL_PATH,
-            map_location=DEVICE,
-            weights_only=True
-        )
+        # ----------------------------------------------------
+        # Load weights directly into CPU memory.
+        # ----------------------------------------------------
+
+        try:
+
+            state_dict = torch.load(
+                MODEL_PATH,
+                map_location="cpu",
+                weights_only=True
+            )
+
+        except TypeError:
+
+            # Compatibility with older PyTorch.
+            state_dict = torch.load(
+                MODEL_PATH,
+                map_location="cpu"
+            )
 
         model.load_state_dict(state_dict)
+
+        del state_dict
+        gc.collect()
 
         model.to(DEVICE)
         model.eval()
@@ -221,47 +281,23 @@ def load_sign_model() -> bool:
         SIGN_MODEL_READY = True
 
         print(
-            f" Sign model loaded successfully "
+            "Sign model loaded successfully "
             f"({NUM_CLASSES} classes)."
         )
 
         return True
 
-    except TypeError:
-        # Compatibility fallback for older PyTorch versions.
-        try:
-            model = SignModel(
-                input_size=INPUT_SIZE,
-                num_classes=NUM_CLASSES
-            )
-
-            state_dict = torch.load(
-                MODEL_PATH,
-                map_location=DEVICE
-            )
-
-            model.load_state_dict(state_dict)
-            model.to(DEVICE)
-            model.eval()
-
-            sign_model = model
-            SIGN_MODEL_READY = True
-
-            print(
-                f" Sign model loaded successfully "
-                f"({NUM_CLASSES} classes)."
-            )
-
-            return True
-
-        except Exception as error:
-            print(f" Sign model loading error: {error}")
-            SIGN_MODEL_READY = False
-            return False
-
     except Exception as error:
-        print(f" Sign model loading error: {error}")
+
+        print(
+            f"Sign model loading error: {error}"
+        )
+
+        sign_model = None
         SIGN_MODEL_READY = False
+
+        gc.collect()
+
         return False
 
 
@@ -270,13 +306,11 @@ def load_sign_model() -> bool:
 # ============================================================
 
 def initialize_mediapipe() -> bool:
-    """
-    Initialize MediaPipe Hands.
-    """
 
     global hands
 
     try:
+
         mp_hands = mp.solutions.hands
 
         hands = mp_hands.Hands(
@@ -287,40 +321,70 @@ def initialize_mediapipe() -> bool:
             min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
         )
 
-        print(" MediaPipe Hands initialized.")
+        print(
+            "MediaPipe Hands initialized."
+        )
+
         return True
 
     except Exception as error:
-        print(f" MediaPipe initialization error: {error}")
+
+        print(
+            f"MediaPipe initialization error: {error}"
+        )
+
         hands = None
+
         return False
 
 
 # ============================================================
-# LOAD FLAN-T5
+# LOAD FLAN-T5 LAZILY
 # ============================================================
 
 def load_flan_model() -> bool:
-    """
-    Load FLAN-T5-small locally.
-
-    No external API is required for inference after
-    the model has been downloaded.
-    """
 
     global flan_tokenizer
     global flan_model
     global FLAN_READY
 
     try:
-        print(f"Loading language model: {FLAN_MODEL_NAME}")
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            FLAN_MODEL_NAME
+        # ----------------------------------------------------
+        # Don't load it twice.
+        # ----------------------------------------------------
+
+        if (
+            FLAN_READY
+            and flan_model is not None
+            and flan_tokenizer is not None
+        ):
+            return True
+
+        print(
+            f"Loading language model: "
+            f"{FLAN_MODEL_NAME}"
         )
 
+        # ----------------------------------------------------
+        # Tokenizer
+        # ----------------------------------------------------
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            FLAN_MODEL_NAME,
+            use_fast=True
+        )
+
+        # ----------------------------------------------------
+        # Model
+        #
+        # low_cpu_mem_usage=True prevents unnecessary
+        # temporary copies during model loading.
+        # ----------------------------------------------------
+
         model = AutoModelForSeq2SeqLM.from_pretrained(
-            FLAN_MODEL_NAME
+            FLAN_MODEL_NAME,
+            low_cpu_mem_usage=True
         )
 
         model.to(DEVICE)
@@ -331,18 +395,59 @@ def load_flan_model() -> bool:
 
         FLAN_READY = True
 
-        print(" FLAN-T5 initialized successfully.")
+        print(
+            "FLAN-T5 initialized successfully."
+        )
 
         return True
 
     except Exception as error:
-        print(f" FLAN-T5 loading failed: {error}")
+
+        print(
+            f"FLAN-T5 loading failed: {error}"
+        )
 
         flan_tokenizer = None
         flan_model = None
         FLAN_READY = False
 
+        gc.collect()
+
         return False
+
+
+# ============================================================
+# UNLOAD FLAN-T5
+# ============================================================
+
+def unload_flan_model():
+
+    global flan_tokenizer
+    global flan_model
+    global FLAN_READY
+
+    try:
+
+        print(
+            "Unloading FLAN-T5 from memory..."
+        )
+
+        flan_model = None
+        flan_tokenizer = None
+
+        FLAN_READY = False
+
+        gc.collect()
+
+        print(
+            "FLAN-T5 unloaded."
+        )
+
+    except Exception as error:
+
+        print(
+            f"FLAN unload error: {error}"
+        )
 
 
 # ============================================================
@@ -356,31 +461,43 @@ async def lifespan(app: FastAPI):
     print("Starting Kaitexy AI Backend")
     print("=" * 60)
 
-    # Load core AI components.
+    # --------------------------------------------------------
+    # CORE COMPONENTS ONLY
+    # --------------------------------------------------------
+    #
+    # FLAN-T5 is intentionally NOT loaded here.
+    #
+    # This dramatically reduces startup RAM usage.
+    # --------------------------------------------------------
+
     load_sign_model()
+
     initialize_mediapipe()
 
-    # FLAN is optional.
-    load_flan_model()
+    print(
+        "FLAN-T5 will be loaded only when "
+        "/correct-text is requested."
+    )
 
     print("=" * 60)
-    print(" Kaitexy AI Backend startup complete")
+    print("Kaitexy AI Backend startup complete")
     print("=" * 60)
 
     yield
 
     # --------------------------------------------------------
-    # Shutdown
+    # SHUTDOWN
     # --------------------------------------------------------
 
     global hands
     global sign_model
-    global flan_model
-    global flan_tokenizer
 
-    print("Shutting down Kaitexy AI...")
+    print(
+        "Shutting down Kaitexy AI..."
+    )
 
     if hands is not None:
+
         try:
             hands.close()
         except Exception:
@@ -388,22 +505,26 @@ async def lifespan(app: FastAPI):
 
     hands = None
     sign_model = None
-    flan_model = None
-    flan_tokenizer = None
 
-    print("Shutdown complete.")
+    unload_flan_model()
+
+    gc.collect()
+
+    print(
+        "Shutdown complete."
+    )
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "AI-powered sign language recognition backend "
-        "for Kaitexy AI."
+        "AI-powered sign language recognition "
+        "backend for Kaitexy AI."
     ),
     lifespan=lifespan,
 )
@@ -416,14 +537,16 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
 
-    # For development/mobile applications.
-    # Restrict this later if browser-only production
-    # access is required.
     allow_origins=["*"],
 
     allow_credentials=False,
 
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "OPTIONS"
+    ],
+
     allow_headers=["*"],
 )
 
@@ -432,14 +555,9 @@ app.add_middleware(
 # LANDMARK EXTRACTION
 # ============================================================
 
-def extract_landmarks(image_bytes: bytes):
-    """
-    Decode an image and extract 21 MediaPipe hand landmarks.
-
-    Returns:
-        np.ndarray with shape (63,)
-        or None if no valid hand is detected.
-    """
+def extract_landmarks(
+    image_bytes: bytes
+):
 
     if hands is None:
         return None
@@ -447,7 +565,7 @@ def extract_landmarks(image_bytes: bytes):
     try:
 
         # ----------------------------------------------------
-        # Convert bytes → NumPy image
+        # Bytes → NumPy
         # ----------------------------------------------------
 
         image_array = np.frombuffer(
@@ -469,7 +587,10 @@ def extract_landmarks(image_bytes: bytes):
 
         image = cv2.resize(
             image,
-            (IMAGE_WIDTH, IMAGE_HEIGHT),
+            (
+                IMAGE_WIDTH,
+                IMAGE_HEIGHT
+            ),
             interpolation=cv2.INTER_AREA
         )
 
@@ -486,29 +607,26 @@ def extract_landmarks(image_bytes: bytes):
         # MediaPipe
         # ----------------------------------------------------
 
-        results = hands.process(image_rgb)
+        results = hands.process(
+            image_rgb
+        )
 
         if not results.multi_hand_landmarks:
             return None
 
-        # ----------------------------------------------------
-        # First detected hand
-        # ----------------------------------------------------
-
-        hand_landmarks = results.multi_hand_landmarks[0]
+        hand_landmarks = (
+            results.multi_hand_landmarks[0]
+        )
 
         features = []
 
         for landmark in hand_landmarks.landmark:
+
             features.extend([
                 landmark.x,
                 landmark.y,
                 landmark.z
             ])
-
-        # ----------------------------------------------------
-        # Validate feature count
-        # ----------------------------------------------------
 
         if len(features) != INPUT_SIZE:
             return None
@@ -519,7 +637,11 @@ def extract_landmarks(image_bytes: bytes):
         )
 
     except Exception as error:
-        print(f"Landmark extraction error: {error}")
+
+        print(
+            f"Landmark extraction error: {error}"
+        )
+
         return None
 
 
@@ -527,26 +649,17 @@ def extract_landmarks(image_bytes: bytes):
 # SIGN PREDICTION
 # ============================================================
 
-def predict_landmarks(landmarks: np.ndarray):
-    """
-    Run PyTorch inference.
+def predict_landmarks(
+    landmarks: np.ndarray
+):
 
-    Returns:
-        (label, confidence)
-
-    If confidence is below the configured threshold,
-    returns:
-        (None, confidence)
-    """
-
-    if not SIGN_MODEL_READY or sign_model is None:
+    if (
+        not SIGN_MODEL_READY
+        or sign_model is None
+    ):
         return None, 0.0
 
     try:
-
-        # ----------------------------------------------------
-        # Validate input
-        # ----------------------------------------------------
 
         if landmarks is None:
             return None, 0.0
@@ -556,56 +669,65 @@ def predict_landmarks(landmarks: np.ndarray):
             dtype=np.float32
         )
 
-        if landmarks.shape != (INPUT_SIZE,):
+        if landmarks.shape != (
+            INPUT_SIZE,
+        ):
             return None, 0.0
-
-        # ----------------------------------------------------
-        # Convert to tensor
-        # ----------------------------------------------------
 
         tensor = torch.from_numpy(
             landmarks
-        ).unsqueeze(0).to(DEVICE)
-
-        # ----------------------------------------------------
-        # Inference
-        # ----------------------------------------------------
+        ).unsqueeze(0)
 
         with torch.inference_mode():
 
-            logits = sign_model(tensor)
+            logits = sign_model(
+                tensor
+            )
 
             probabilities = torch.softmax(
                 logits,
                 dim=1
             )
 
-            confidence, prediction = torch.max(
-                probabilities,
-                dim=1
+            confidence, prediction = (
+                torch.max(
+                    probabilities,
+                    dim=1
+                )
             )
 
-        index = int(prediction.item())
-        score = float(confidence.item())
+        index = int(
+            prediction.item()
+        )
 
-        # ----------------------------------------------------
-        # Validate class index
-        # ----------------------------------------------------
+        score = float(
+            confidence.item()
+        )
 
-        if index < 0 or index >= len(LABELS):
+        if (
+            index < 0
+            or index >= len(LABELS)
+        ):
             return None, 0.0
 
-        # ----------------------------------------------------
-        # Confidence filtering
-        # ----------------------------------------------------
-
-        if score < CONFIDENCE_THRESHOLD:
+        if (
+            score
+            < CONFIDENCE_THRESHOLD
+        ):
             return None, score
 
-        return LABELS[index], score
+        return (
+            LABELS[index],
+            score
+        )
 
     except Exception as error:
-        print(f"PyTorch prediction error: {error}")
+
+        print(
+            f"PyTorch prediction error: "
+            f"{error}"
+        )
+
         return None, 0.0
 
 
@@ -613,12 +735,9 @@ def predict_landmarks(landmarks: np.ndarray):
 # FLAN TEXT CORRECTION
 # ============================================================
 
-def correct_text_flan(text: str) -> str:
-    """
-    Correct spelling and grammar while preserving meaning.
-
-    FLAN-T5 is used locally.
-    """
+def correct_text_flan(
+    text: str
+) -> str:
 
     if not text:
         return ""
@@ -629,13 +748,13 @@ def correct_text_flan(text: str) -> str:
         return ""
 
     if not FLAN_READY:
-        # Graceful fallback.
         return text
 
     try:
 
         prompt = (
-            "Correct the spelling and grammar of the sentence. "
+            "Correct the spelling and grammar "
+            "of the sentence. "
             "Preserve the original meaning. "
             "Do not add new information. "
             "Do not remove important information. "
@@ -654,37 +773,34 @@ def correct_text_flan(text: str) -> str:
             max_length=128
         )
 
-        inputs = {
-            key: value.to(DEVICE)
-            for key, value in inputs.items()
-        }
-
         # ----------------------------------------------------
-        # Generation
+        # CPU inference
         # ----------------------------------------------------
 
         with torch.inference_mode():
 
-            output_tokens = flan_model.generate(
-                **inputs,
-                max_new_tokens=FLAN_MAX_NEW_TOKENS,
-                num_beams=FLAN_NUM_BEAMS,
-                do_sample=False,
-                early_stopping=True,
+            output_tokens = (
+                flan_model.generate(
+                    **inputs,
+                    max_new_tokens=FLAN_MAX_NEW_TOKENS,
+                    num_beams=FLAN_NUM_BEAMS,
+                    do_sample=False,
+                    early_stopping=True,
+                )
             )
 
-        # ----------------------------------------------------
-        # Decode
-        # ----------------------------------------------------
+        corrected = (
+            flan_tokenizer.decode(
+                output_tokens[0],
+                skip_special_tokens=True
+            )
+            .strip()
+        )
 
-        corrected = flan_tokenizer.decode(
-            output_tokens[0],
-            skip_special_tokens=True
-        ).strip()
+        del inputs
+        del output_tokens
 
-        # ----------------------------------------------------
-        # Safety fallback
-        # ----------------------------------------------------
+        gc.collect()
 
         if not corrected:
             return text
@@ -694,8 +810,11 @@ def correct_text_flan(text: str) -> str:
     except Exception as error:
 
         print(
-            f"FLAN correction error: {error}"
+            f"FLAN correction error: "
+            f"{error}"
         )
+
+        gc.collect()
 
         return text
 
@@ -704,54 +823,87 @@ def correct_text_flan(text: str) -> str:
 # REQUEST MODELS
 # ============================================================
 
-class CorrectTextRequest(BaseModel):
+class CorrectTextRequest(
+    BaseModel
+):
 
     text: str = Field(
         ...,
         min_length=1,
         max_length=500,
-        description="Text produced by the sign recognition system."
+        description=(
+            "Text produced by the "
+            "sign recognition system."
+        )
     )
 
 
 # ============================================================
-# HEALTH ENDPOINT
+# HEALTH
 # ============================================================
 
 @app.get("/health")
 async def health():
 
     return {
+
         "status": "healthy",
+
         "service": APP_NAME,
+
         "version": APP_VERSION,
 
-        "sign_model_ready": SIGN_MODEL_READY,
-        "flan_enabled": FLAN_READY,
+        "sign_model_ready":
+            SIGN_MODEL_READY,
 
-        "labels": len(LABELS),
-        "input_size": INPUT_SIZE,
+        "flan_loaded":
+            FLAN_READY,
+
+        "labels":
+            len(LABELS),
+
+        "input_size":
+            INPUT_SIZE,
 
         "confidence_threshold":
             CONFIDENCE_THRESHOLD,
 
-        "device": str(DEVICE),
+        "device":
+            str(DEVICE),
+
+        "flan_model":
+            FLAN_MODEL_NAME,
+
+        "flan_lazy_loading":
+            True,
+
     }
 
 
 # ============================================================
-# ROOT ENDPOINT
+# ROOT
 # ============================================================
 
 @app.get("/")
 async def root():
 
     return {
-        "message": "Kaitexy AI Backend is running.",
-        "version": APP_VERSION,
-        "health": "/health",
-        "prediction_endpoint": "/predict-sign",
-        "text_endpoint": "/correct-text",
+
+        "message":
+            "Kaitexy AI Backend is running.",
+
+        "version":
+            APP_VERSION,
+
+        "health":
+            "/health",
+
+        "prediction_endpoint":
+            "/predict-sign",
+
+        "text_endpoint":
+            "/correct-text",
+
     }
 
 
@@ -767,7 +919,7 @@ async def predict_sign(
     try:
 
         # ----------------------------------------------------
-        # Check model
+        # Model check
         # ----------------------------------------------------
 
         if not SIGN_MODEL_READY:
@@ -777,15 +929,18 @@ async def predict_sign(
                 content={
                     "prediction": "",
                     "confidence": 0.0,
-                    "status": "Sign model not ready"
+                    "status":
+                        "Sign model not ready"
                 }
             )
 
         # ----------------------------------------------------
-        # Validate file type
+        # File type validation
         # ----------------------------------------------------
 
-        content_type = file.content_type or ""
+        content_type = (
+            file.content_type or ""
+        )
 
         allowed_types = {
             "image/jpeg",
@@ -794,14 +949,18 @@ async def predict_sign(
             "image/jpg",
         }
 
-        if content_type not in allowed_types:
+        if (
+            content_type
+            not in allowed_types
+        ):
 
             return JSONResponse(
                 status_code=400,
                 content={
                     "prediction": "",
                     "confidence": 0.0,
-                    "status": "Unsupported image type"
+                    "status":
+                        "Unsupported image type"
                 }
             )
 
@@ -809,55 +968,70 @@ async def predict_sign(
         # Read image
         # ----------------------------------------------------
 
-        image_bytes = await file.read()
+        image_bytes = (
+            await file.read()
+        )
 
         if not image_bytes:
 
             return {
                 "prediction": "",
                 "confidence": 0.0,
-                "status": "Empty image"
+                "status":
+                    "Empty image"
             }
 
         # ----------------------------------------------------
-        # Extract landmarks
+        # Landmark extraction
         # ----------------------------------------------------
 
-        landmarks = await asyncio.to_thread(
-            extract_landmarks,
-            image_bytes
+        landmarks = (
+            await asyncio.to_thread(
+                extract_landmarks,
+                image_bytes
+            )
         )
+
+        # Release image bytes as soon as possible.
+        del image_bytes
 
         if landmarks is None:
 
             return {
                 "prediction": "",
                 "confidence": 0.0,
-                "status": "No hand detected"
+                "status":
+                    "No hand detected"
             }
 
         # ----------------------------------------------------
         # Prediction
         # ----------------------------------------------------
 
-        letter, confidence = await asyncio.to_thread(
-            predict_landmarks,
-            landmarks
+        letter, confidence = (
+            await asyncio.to_thread(
+                predict_landmarks,
+                landmarks
+            )
         )
 
+        del landmarks
+
         # ----------------------------------------------------
-        # Low-confidence result
+        # Low confidence
         # ----------------------------------------------------
 
         if letter is None:
 
             return {
                 "prediction": "",
-                "confidence": round(
-                    confidence,
-                    4
-                ),
-                "status": "Low confidence"
+                "confidence":
+                    round(
+                        confidence,
+                        4
+                    ),
+                "status":
+                    "Low confidence"
             }
 
         # ----------------------------------------------------
@@ -865,18 +1039,26 @@ async def predict_sign(
         # ----------------------------------------------------
 
         return {
-            "prediction": letter,
-            "confidence": round(
-                confidence,
-                4
-            ),
-            "status": "Prediction successful"
+
+            "prediction":
+                letter,
+
+            "confidence":
+                round(
+                    confidence,
+                    4
+                ),
+
+            "status":
+                "Prediction successful"
+
         }
 
     except Exception as error:
 
         print(
-            f"Predict endpoint error: {error}"
+            f"Predict endpoint error: "
+            f"{error}"
         )
 
         return JSONResponse(
@@ -884,8 +1066,10 @@ async def predict_sign(
             content={
                 "prediction": "",
                 "confidence": 0.0,
-                "status": "Server error",
-                "error": str(error),
+                "status":
+                    "Server error",
+                "error":
+                    str(error),
             }
         )
 
@@ -899,57 +1083,138 @@ async def correct_text(
     request: CorrectTextRequest
 ):
 
-    raw_text = request.text.strip()
+    raw_text = (
+        request.text.strip()
+    )
 
     if not raw_text:
 
         return {
             "raw_text": "",
             "corrected_text": "",
-            "status": "Empty text"
+            "status":
+                "Empty text"
         }
 
-    try:
+    # --------------------------------------------------------
+    # Only one FLAN loading/inference operation at a time.
+    # This prevents multiple simultaneous requests from
+    # creating multiple large memory allocations.
+    # --------------------------------------------------------
 
-        corrected = await asyncio.to_thread(
-            correct_text_flan,
-            raw_text
-        )
+    async with flan_lock:
 
-        return {
-            "raw_text": raw_text,
-            "corrected_text": corrected,
-            "status": (
-                "Text corrected successfully"
-                if FLAN_READY
-                else "FLAN unavailable; original text returned"
+        try:
+
+            # ------------------------------------------------
+            # Lazy load FLAN-T5.
+            #
+            # It is NOT loaded during application startup.
+            # ------------------------------------------------
+
+            if not FLAN_READY:
+
+                loaded = (
+                    await asyncio.to_thread(
+                        load_flan_model
+                    )
+                )
+
+                if not loaded:
+
+                    return {
+                        "raw_text":
+                            raw_text,
+
+                        "corrected_text":
+                            raw_text,
+
+                        "status":
+                            "FLAN unavailable; "
+                            "original text returned"
+                    }
+
+            # ------------------------------------------------
+            # Correct text
+            # ------------------------------------------------
+
+            corrected = (
+                await asyncio.to_thread(
+                    correct_text_flan,
+                    raw_text
+                )
             )
-        }
 
-    except Exception as error:
+            result = {
 
-        print(
-            f"Text correction error: {error}"
-        )
+                "raw_text":
+                    raw_text,
 
-        return {
-            "raw_text": raw_text,
-            "corrected_text": raw_text,
-            "status": "Correction failed",
-            "error": str(error)
-        }
+                "corrected_text":
+                    corrected,
+
+                "status":
+                    "Text corrected successfully"
+
+            }
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Unload FLAN after the request.
+            #
+            # This keeps Render RAM low.
+            # ------------------------------------------------
+
+            if UNLOAD_FLAN_AFTER_REQUEST:
+
+                await asyncio.to_thread(
+                    unload_flan_model
+                )
+
+            return result
+
+        except Exception as error:
+
+            print(
+                f"Text correction error: "
+                f"{error}"
+            )
+
+            # Try to release memory.
+            if UNLOAD_FLAN_AFTER_REQUEST:
+
+                await asyncio.to_thread(
+                    unload_flan_model
+                )
+
+            return {
+
+                "raw_text":
+                    raw_text,
+
+                "corrected_text":
+                    raw_text,
+
+                "status":
+                    "Correction failed",
+
+                "error":
+                    str(error)
+
+            }
 
 
 # ============================================================
-# RUN LOCALLY
+# END
 # ============================================================
 #
-# Use:
+# Render start command:
 #
-#   uvicorn main:app --host 0.0.0.0 --port 8000
+# uvicorn main:app --host 0.0.0.0 --port $PORT
 #
-# For Render:
+# Local:
 #
-#   uvicorn main:app --host 0.0.0.0 --port $PORT
+# uvicorn main:app --host 0.0.0.0 --port 8000
 #
 # ============================================================

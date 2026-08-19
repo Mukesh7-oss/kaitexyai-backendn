@@ -9,5 +9,6 @@ mediapipe==0.10.21
 
 transformers
 huggingface-hub
+accelerate
 
 pydantic
