@@ -1,13 +1,13 @@
 venv/
 __pycache__/
 *.pyc
-*.pyo
-
-.env
 
 dataset/
 landmark_dataset/
 temp_dataset/
 *.zip
+
+.git/
+.gitignore
 
 uploads/

@@ -1,222 +1,73 @@
-import cv2
-import mediapipe as mp
-import numpy as np
-import os
+import os, zipfile, shutil, cv2, numpy as np, mediapipe as mp
+from multiprocessing import Pool, cpu_count
 
+EXTRACT_DIR = "temp_dataset"
+OUTPUT_DIR = "landmark_dataset"
+ZIP_PATH = "D:/KaitexyAI-new/backend/asl_alphabet_train.zip"
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
-label = "Z"
-samples_to_collect = 2000
-save_dir = f"dataset/{label}"
+def clean_dirs():
+    for folder in [EXTRACT_DIR, OUTPUT_DIR]:
+        if os.path.exists(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        os.makedirs(folder, exist_ok=True)
 
-# Create folder
-os.makedirs(save_dir, exist_ok=True)
+def extract_zip():
+    with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
+        zip_ref.extractall(EXTRACT_DIR)
 
-
-# ========== MEDIAPIPE ==========
+def find_dataset_root(path):
+    for root, dirs, files in os.walk(path):
+        image_class_count = 0
+        for d in dirs:
+            subdir = os.path.join(root, d)
+            try:
+                if any(f.lower().endswith(IMAGE_EXTENSIONS) for f in os.listdir(subdir)):
+                    image_class_count += 1
+            except Exception:
+                pass
+        if image_class_count >= 2:
+            return root
+    return None
 
 mp_hands = mp.solutions.hands
-
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
-)
-
-
-# ========== CAMERA ==========
-
-cap = cv2.VideoCapture(0)
-
-count = 0
-
-print(f"Collecting data for: {label}")
-print("Press 'S' to START / RESUME collecting")
-print("Press 'P' to PAUSE collecting")
-print("Press 'Q' to QUIT")
-
-
-# Collection state
-collecting = False
-
-
-# ========== MAIN LOOP ==========
-
-while True:
-
-    ret, frame = cap.read()
-
-    if not ret:
-        break
-
-    # Flip camera horizontally
-    frame = cv2.flip(frame, 1)
-
-    # Convert BGR → RGB
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # MediaPipe processing
-    result = hands.process(rgb)
-
-
-    # ============================================================
-    # COLLECT LANDMARKS
-    # ============================================================
-
-    if result.multi_hand_landmarks:
-
-        for hand_landmarks in result.multi_hand_landmarks:
-
-            points = []
-
-            for lm in hand_landmarks.landmark:
-
-                points.extend([
-                    lm.x,
-                    lm.y,
-                    lm.z
-                ])
-
-
-            # Save only when collection is active
-            if collecting and count < samples_to_collect:
-
-                np.save(
-                    f"{save_dir}/{count}.npy",
-                    points
-                )
-
-                count += 1
-
-
-    # ============================================================
-    # DISPLAY INFORMATION
-    # ============================================================
-
-    cv2.putText(
-        frame,
-        f"Label: {label}",
-        (10, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (255, 0, 0),
-        2
-    )
-
-
-    cv2.putText(
-        frame,
-        f"Saved: {count}/{samples_to_collect}",
-        (10, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2
-    )
-
-
-    # ============================================================
-    # STATUS
-    # ============================================================
-
-    if collecting:
-
-        cv2.putText(
-            frame,
-            "STATUS: COLLECTING",
-            (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-
-    else:
-
-        cv2.putText(
-            frame,
-            "STATUS: PAUSED",
-            (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2
-        )
-
-
-    # ============================================================
-    # KEYBOARD INSTRUCTIONS
-    # ============================================================
-
-    cv2.putText(
-        frame,
-        "S = Start/Resume | P = Pause | Q = Quit",
-        (10, 160),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # Display camera
-    cv2.imshow(
-        "Dataset Collector",
-        frame
-    )
-
-
-    # ============================================================
-    # KEYBOARD INPUT
-    # ============================================================
-
-    key = cv2.waitKey(1) & 0xFF
-
-
-    # START / RESUME
-    if key == ord('s') or key == ord('S'):
-
-        collecting = True
-
-        print("Collection STARTED / RESUMED")
-
-
-    # PAUSE
-    elif key == ord('p') or key == ord('P'):
-
-        collecting = False
-
-        print(f"Collection PAUSED at {count}/{samples_to_collect}")
-
-
-    # QUIT
-    elif key == ord('q') or key == ord('Q'):
-
-        print(f"Collection stopped at {count}/{samples_to_collect}")
-
-        break
-
-
-    # ============================================================
-    # AUTOMATIC FINISH
-    # ============================================================
-
-    if count >= samples_to_collect:
-
-        print(
-            f"Finished collecting "
-            f"{samples_to_collect} samples for {label}"
-        )
-
-        break
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-cap.release()
-
-cv2.destroyAllWindows()
-
-hands.close()
+hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1, min_detection_confidence=0.5)
+
+def process_image(args):
+    image_path, output_class_path = args
+    image = cv2.imread(image_path)
+    if image is None:
+        return None
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+    if not results.multi_hand_landmarks:
+        return None
+    landmarks = []
+    for lm in results.multi_hand_landmarks[0].landmark:
+        landmarks.extend([lm.x, lm.y, lm.z])
+    if len(landmarks) != 63:
+        return None
+    out_file = os.path.join(output_class_path, os.path.splitext(os.path.basename(image_path))[0] + ".npy")
+    np.save(out_file, np.array(landmarks, dtype=np.float32))
+    return out_file
+
+if __name__ == "__main__":
+    clean_dirs()
+    extract_zip()
+    dataset_path = find_dataset_root(EXTRACT_DIR)
+    class_folders = sorted([f for f in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, f))])
+
+    tasks = []
+    for cls in class_folders:
+        in_path = os.path.join(dataset_path, cls)
+        out_path = os.path.join(OUTPUT_DIR, cls)
+        os.makedirs(out_path, exist_ok=True)
+        for f in os.listdir(in_path):
+            if f.lower().endswith(IMAGE_EXTENSIONS):
+                tasks.append((os.path.join(in_path, f), out_path))
+
+    print(f"Processing {len(tasks)} images with {cpu_count()} cores...")
+    with Pool(cpu_count()) as p:
+        results = p.map(process_image, tasks)
+
+    print("Done. Extracted landmarks:", sum(1 for r in results if r))
