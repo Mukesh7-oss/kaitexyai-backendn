@@ -1,31 +1,52 @@
 # ============================================================
-# KAITEXY AI - GEMINI SIGN LANGUAGE BACKEND
+# KAITEXY AI
+# GEMINI VISION SIGN LANGUAGE BACKEND
 # ============================================================
 #
 # Flutter
-#    ↓
+#    |
+#    | POST /predict-sign
+#    | multipart/form-data
+#    | file = image
+#    v
 # FastAPI
-#    ↓
+#    |
+#    v
 # Gemini Vision
-#    ↓
+#    |
+#    v
 # Sign prediction
-#    ↓
-# Flutter builds text
-#    ↓
-# /correct-text
-#    ↓
-# Gemini text correction
+#    |
+#    v
+# JSON
+# {
+#   "prediction": "A",
+#   "confidence": 0.94,
+#   "status": "Prediction successful"
+# }
+#    |
+#    v
+# Flutter
+#
+# IMPORTANT:
+# Gemini performs the actual image recognition.
+# No PyTorch.
+# No MediaPipe.
+# No .pt model.
+# No 63-landmark processing.
 #
 # ============================================================
 
 import asyncio
+import json
 import os
 import re
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 from pydantic import BaseModel, Field
 
 from google import genai
@@ -36,27 +57,59 @@ from google.genai import types
 # CONFIGURATION
 # ============================================================
 
-APP_NAME = "Kaitexy AI Sign Language Backend"
-APP_VERSION = "7.2-GEMINI"
+APP_NAME = "Kaitexy AI Gemini Sign Language Backend"
+
+APP_VERSION = "8.0-GEMINI"
+
+# ------------------------------------------------------------
+# Gemini API key
+# ------------------------------------------------------------
 
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
     ""
 ).strip()
 
+# ------------------------------------------------------------
+# Gemini model
+# ------------------------------------------------------------
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.6-flash"
+).strip()
+
+# ------------------------------------------------------------
+# Supported labels
+# ------------------------------------------------------------
+
+LABELS = list(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
 
-LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# ------------------------------------------------------------
+# Confidence threshold
+#
+# IMPORTANT:
+#
+# Flutter receives Gemini's confidence.
+#
+# We use 0.80 as the backend acceptance threshold.
+#
+# However, we DO NOT hide the confidence from Flutter.
+# Flutter will receive the actual confidence value.
+# ------------------------------------------------------------
 
 CONFIDENCE_THRESHOLD = float(
     os.getenv(
         "CONFIDENCE_THRESHOLD",
-        "0.60"
+        "0.80"
     )
 )
+
+# ------------------------------------------------------------
+# Maximum uploaded image size
+# ------------------------------------------------------------
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
@@ -70,23 +123,32 @@ gemini_client: Optional[genai.Client] = None
 GEMINI_READY = False
 
 
+# ============================================================
+# INITIALIZE GEMINI
+# ============================================================
+
 def initialize_gemini() -> bool:
 
     global gemini_client
     global GEMINI_READY
 
+    print()
+    print("=" * 70)
+    print("INITIALIZING GEMINI")
+    print("=" * 70)
+
+    if not GEMINI_API_KEY:
+
+        print(
+            "ERROR: GEMINI_API_KEY is not set."
+        )
+
+        gemini_client = None
+        GEMINI_READY = False
+
+        return False
+
     try:
-
-        if not GEMINI_API_KEY:
-
-            print(
-                "ERROR: GEMINI_API_KEY environment "
-                "variable is missing."
-            )
-
-            GEMINI_READY = False
-
-            return False
 
         gemini_client = genai.Client(
             api_key=GEMINI_API_KEY
@@ -95,16 +157,24 @@ def initialize_gemini() -> bool:
         GEMINI_READY = True
 
         print(
-            f"Gemini initialized successfully: "
-            f"{GEMINI_MODEL}"
+            f"Gemini initialized successfully."
         )
+
+        print(
+            f"Model: {GEMINI_MODEL}"
+        )
+
+        print("=" * 70)
 
         return True
 
     except Exception as error:
 
         print(
-            "Gemini initialization error:",
+            "Gemini initialization failed:"
+        )
+
+        print(
             repr(error)
         )
 
@@ -115,16 +185,19 @@ def initialize_gemini() -> bool:
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
+
     title=APP_NAME,
+
     version=APP_VERSION,
+
     description=(
-        "AI-powered sign language recognition "
-        "backend using Gemini Vision."
-    ),
+        "Kaitexy AI backend using "
+        "Gemini Vision for sign recognition."
+    )
 )
 
 
@@ -133,6 +206,7 @@ app = FastAPI(
 # ============================================================
 
 app.add_middleware(
+
     CORSMiddleware,
 
     allow_origins=["*"],
@@ -145,7 +219,7 @@ app.add_middleware(
         "OPTIONS"
     ],
 
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -156,24 +230,29 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
 
-    print("=" * 60)
-    print("Starting Kaitexy AI Gemini Backend")
-    print("=" * 60)
+    print()
+    print("=" * 70)
+    print("STARTING KAITEXY AI BACKEND")
+    print("=" * 70)
 
     initialize_gemini()
 
-    print("=" * 60)
+    print()
 
     if GEMINI_READY:
+
         print(
-            "Kaitexy AI Gemini Backend READY"
-        )
-    else:
-        print(
-            "WARNING: Gemini is NOT ready"
+            "STATUS: GEMINI READY"
         )
 
-    print("=" * 60)
+    else:
+
+        print(
+            "STATUS: GEMINI NOT READY"
+        )
+
+    print("=" * 70)
+    print()
 
 
 # ============================================================
@@ -191,11 +270,12 @@ async def shutdown_event():
     )
 
     gemini_client = None
+
     GEMINI_READY = False
 
 
 # ============================================================
-# GEMINI RESPONSE MODEL
+# GEMINI STRUCTURED RESPONSE
 # ============================================================
 
 class SignResult(BaseModel):
@@ -208,7 +288,8 @@ class SignResult(BaseModel):
         "Y", "Z", "UNKNOWN"
     ] = Field(
         description=(
-            "One uppercase ASL alphabet letter "
+            "Exactly one uppercase ASL "
+            "fingerspelling alphabet letter "
             "from A to Z, or UNKNOWN."
         )
     )
@@ -217,71 +298,205 @@ class SignResult(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Recognition confidence from "
-            "0.0 to 1.0."
+            "Confidence of the visual prediction "
+            "from 0.0 to 1.0."
         )
     )
 
 
 # ============================================================
-# SIGN RECOGNITION PROMPT
+# GEMINI SIGN RECOGNITION PROMPT
 # ============================================================
 
-SIGN_PROMPT = """
-You are the vision recognition engine for Kaitexy AI.
+SIGN_PROMPT = r"""
+You are the visual sign-language recognition engine
+for Kaitexy AI.
 
-Your ONLY task is to recognize ONE STATIC ASL
-FINGERSPELLING ALPHABET LETTER from the provided image.
+YOUR TASK:
 
-Allowed letters:
+Look at the supplied image and identify the SINGLE
+STATIC ASL FINGERSPELLING ALPHABET LETTER shown
+by the hand.
 
-A B C D E F G H I J K L M
-N O P Q R S T U V W X Y Z
+SUPPORTED LETTERS:
 
-Analyze ONLY the visible hand and fingers.
+A
+B
+C
+D
+E
+F
+G
+H
+I
+J
+K
+L
+M
+N
+O
+P
+Q
+R
+S
+T
+U
+V
+W
+X
+Y
+Z
 
-IMPORTANT RULES:
+============================================================
+VISUAL ANALYSIS
+============================================================
 
-1. Identify the hand shape carefully.
-2. Pay attention to finger position.
-3. Pay attention to thumb position.
-4. Pay attention to finger separation.
-5. Pay attention to palm orientation.
-6. Ignore the person's face.
-7. Ignore clothing.
-8. Ignore the background.
-9. Ignore written text.
-10. Ignore objects that are not part of the hand.
-11. Do not return a word.
-12. Do not return multiple letters.
-13. Return exactly ONE letter when sufficiently clear.
-14. If the hand is not visible, badly cropped, or genuinely
-    impossible to identify, return UNKNOWN.
-15. Do not invent a letter.
-16. This is STATIC ASL FINGERSPELLING.
+Carefully inspect:
 
-Confidence must be between 0.0 and 1.0.
+1. Number of visible fingers.
+2. Which fingers are extended.
+3. Which fingers are bent.
+4. Thumb position.
+5. Finger-to-thumb contact.
+6. Finger separation.
+7. Palm orientation.
+8. Back-of-hand orientation.
+9. Hand rotation.
+10. Overall hand shape.
+11. Relative position of the fingers.
+12. Whether the image actually contains a hand.
 
-Return ONLY the structured response requested by the API.
+============================================================
+IGNORE
+============================================================
+
+Ignore:
+
+- Face
+- Hair
+- Clothes
+- Background
+- Objects
+- Written text
+- Logos
+- Watermarks
+- Camera interface
+- Decorations
+
+Only the hand gesture matters.
+
+============================================================
+IMPORTANT
+============================================================
+
+This is STATIC ASL FINGERSPELLING.
+
+Do NOT predict:
+
+- a word
+- a sentence
+- a spoken-language word
+- multiple letters
+- multiple guesses
+
+Return exactly ONE alphabet letter.
+
+If the hand is:
+
+- not visible
+- severely cropped
+- too blurry
+- obstructed
+- ambiguous
+- not a recognizable static ASL alphabet sign
+
+return:
+
+UNKNOWN
+
+============================================================
+CONFIDENCE
+============================================================
+
+Confidence must represent how certain you are that the
+visible hand gesture corresponds to the predicted letter.
+
+Use:
+
+0.90 - 1.00
+Very clear and highly reliable gesture.
+
+0.80 - 0.89
+Clear gesture with good confidence.
+
+0.60 - 0.79
+Some uncertainty.
+
+0.40 - 0.59
+Weak or ambiguous evidence.
+
+0.00 - 0.39
+Very uncertain / essentially unknown.
+
+Do NOT artificially increase confidence.
+
+If the image is ambiguous, return UNKNOWN rather than
+inventing a letter.
+
+============================================================
+FINAL OUTPUT
+============================================================
+
+Return only the structured response required by the API.
 """
 
 
 # ============================================================
-# NORMALIZE PREDICTION
+# MIME TYPE VALIDATION
+# ============================================================
+
+SUPPORTED_MIME_TYPES = {
+
+    "image/jpeg": "image/jpeg",
+
+    "image/jpg": "image/jpeg",
+
+    "image/png": "image/png",
+
+    "image/webp": "image/webp"
+
+}
+
+
+# ============================================================
+# NORMALIZE GEMINI RESULT
 # ============================================================
 
 def normalize_prediction(
-    prediction: object,
-    confidence: object
+    prediction,
+    confidence
 ):
+
+    # --------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------
 
     if not isinstance(
         prediction,
         str
     ):
+
         return None, 0.0
 
-    prediction = prediction.strip().upper()
+    prediction = (
+        prediction
+        .strip()
+        .upper()
+    )
+
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
 
     try:
 
@@ -301,15 +516,27 @@ def normalize_prediction(
         )
     )
 
+    # --------------------------------------------------------
+    # UNKNOWN
+    # --------------------------------------------------------
+
     if prediction == "UNKNOWN":
 
         return None, score
+
+    # --------------------------------------------------------
+    # Remove accidental formatting
+    # --------------------------------------------------------
 
     prediction = re.sub(
         r"[^A-Z]",
         "",
         prediction
     )
+
+    # --------------------------------------------------------
+    # Must be exactly one letter
+    # --------------------------------------------------------
 
     if (
         len(prediction) != 1
@@ -322,7 +549,7 @@ def normalize_prediction(
 
 
 # ============================================================
-# GEMINI SIGN RECOGNITION
+# GEMINI VISION PREDICTION
 # ============================================================
 
 async def recognize_sign(
@@ -335,22 +562,42 @@ async def recognize_sign(
         return (
             None,
             0.0,
-            "Gemini unavailable"
+            "Gemini model not ready"
+        )
+
+    if gemini_client is None:
+
+        return (
+            None,
+            0.0,
+            "Gemini client unavailable"
         )
 
     try:
 
         # ----------------------------------------------------
-        # Image
+        # Create image part
         # ----------------------------------------------------
 
         image_part = types.Part.from_bytes(
+
             data=image_bytes,
+
             mime_type=mime_type
         )
 
         # ----------------------------------------------------
         # Gemini request
+        # ----------------------------------------------------
+        #
+        # Gemini receives:
+        #
+        #   IMAGE
+        #   +
+        #   SIGN PROMPT
+        #
+        # Gemini performs the recognition.
+        #
         # ----------------------------------------------------
 
         response = await asyncio.to_thread(
@@ -366,23 +613,16 @@ async def recognize_sign(
 
             config=types.GenerateContentConfig(
 
-                # Structured JSON
+                # Structured JSON output
                 response_mime_type="application/json",
 
                 response_schema=SignResult,
 
-                # Give the model enough room.
+                # Small because response is tiny
                 max_output_tokens=100,
 
-                # Keep reasoning minimal for speed.
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                ),
-
-                # Prevent tools / automatic function behavior.
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                )
+                # Deterministic visual classification
+                temperature=0.0
             )
         )
 
@@ -390,9 +630,10 @@ async def recognize_sign(
         # Diagnostics
         # ----------------------------------------------------
 
-        print("=" * 60)
-        print("GEMINI RESPONSE RECEIVED")
-        print("=" * 60)
+        print()
+        print("-" * 70)
+        print("GEMINI PREDICTION")
+        print("-" * 70)
 
         raw_text = getattr(
             response,
@@ -401,13 +642,12 @@ async def recognize_sign(
         ) or ""
 
         print(
-            "RAW TEXT:",
+            "Gemini raw response:",
             repr(raw_text)
         )
 
         # ----------------------------------------------------
-        # BEST METHOD:
-        # Use SDK parsed structured response.
+        # Try SDK parsed response
         # ----------------------------------------------------
 
         parsed = getattr(
@@ -419,8 +659,7 @@ async def recognize_sign(
         if parsed is not None:
 
             print(
-                "PARSED RESPONSE:",
-                repr(parsed)
+                "Structured response received."
             )
 
             prediction = getattr(
@@ -436,17 +675,37 @@ async def recognize_sign(
             )
 
             letter, score = normalize_prediction(
+
                 prediction,
+
                 confidence
             )
+
+            print(
+                "Prediction:",
+                prediction
+            )
+
+            print(
+                "Confidence:",
+                score
+            )
+
+            # ------------------------------------------------
+            # UNKNOWN
+            # ------------------------------------------------
 
             if letter is None:
 
                 return (
                     None,
                     score,
-                    "Gesture not confidently recognized"
+                    "Hand not confidently recognized"
                 )
+
+            # ------------------------------------------------
+            # Confidence threshold
+            # ------------------------------------------------
 
             if score < CONFIDENCE_THRESHOLD:
 
@@ -463,13 +722,10 @@ async def recognize_sign(
             )
 
         # ----------------------------------------------------
-        # FALLBACK:
-        # Parse raw JSON if SDK did not populate .parsed.
+        # FALLBACK: parse response.text
         # ----------------------------------------------------
 
         if raw_text:
-
-            import json
 
             try:
 
@@ -487,8 +743,20 @@ async def recognize_sign(
                 )
 
                 letter, score = normalize_prediction(
+
                     prediction,
+
                     confidence
+                )
+
+                print(
+                    "Fallback prediction:",
+                    prediction
+                )
+
+                print(
+                    "Fallback confidence:",
+                    score
                 )
 
                 if letter is None:
@@ -496,7 +764,7 @@ async def recognize_sign(
                     return (
                         None,
                         score,
-                        "Gesture not confidently recognized"
+                        "Hand not confidently recognized"
                     )
 
                 if score < CONFIDENCE_THRESHOLD:
@@ -513,20 +781,16 @@ async def recognize_sign(
                     "Prediction successful"
                 )
 
-            except Exception as parse_error:
+            except Exception as error:
 
                 print(
-                    "JSON parsing error:",
-                    repr(parse_error)
+                    "Structured JSON parsing error:",
+                    repr(error)
                 )
 
         # ----------------------------------------------------
-        # Empty / incomplete response.
+        # No usable response
         # ----------------------------------------------------
-
-        print(
-            "Gemini returned no complete structured response."
-        )
 
         return (
             None,
@@ -536,17 +800,16 @@ async def recognize_sign(
 
     except Exception as error:
 
-        print("=" * 60)
-        print(
-            "GEMINI SIGN RECOGNITION ERROR"
-        )
-        print("=" * 60)
+        print()
+        print("=" * 70)
+        print("GEMINI ERROR")
+        print("=" * 70)
 
         print(
             repr(error)
         )
 
-        print("=" * 60)
+        print("=" * 70)
 
         return (
             None,
@@ -556,120 +819,38 @@ async def recognize_sign(
 
 
 # ============================================================
-# TEXT CORRECTION PROMPT
+# ROOT
 # ============================================================
 
-TEXT_CORRECTION_PROMPT = """
-You are the language correction engine for Kaitexy AI.
+@app.get("/")
+async def root():
 
-Correct the spelling and grammar of the supplied sentence.
+    return {
 
-Rules:
+        "message":
+            "Kaitexy AI Gemini Backend is running.",
 
-1. Preserve the original meaning.
-2. Do not add information.
-3. Do not remove important information.
-4. Do not invent words.
-5. Keep the sentence natural.
-6. Return ONLY the corrected sentence.
-7. Do not explain your changes.
+        "version":
+            APP_VERSION,
 
-Text:
-"""
+        "model":
+            GEMINI_MODEL,
 
+        "gemini_ready":
+            GEMINI_READY,
 
-# ============================================================
-# GEMINI TEXT CORRECTION
-# ============================================================
+        "prediction_endpoint":
+            "/predict-sign",
 
-async def correct_text_gemini(
-    text: str
-) -> str:
+        "health_endpoint":
+            "/health",
 
-    if not text:
-        return ""
+        "recognition":
+            "Gemini Vision",
 
-    if not GEMINI_READY:
-        return text
-
-    try:
-
-        prompt = (
-            TEXT_CORRECTION_PROMPT
-            + text.strip()
-        )
-
-        response = await asyncio.to_thread(
-
-            gemini_client.models.generate_content,
-
-            model=GEMINI_MODEL,
-
-            contents=prompt,
-
-            config=types.GenerateContentConfig(
-
-                max_output_tokens=100,
-
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                ),
-
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                )
-            )
-        )
-
-        corrected = getattr(
-            response,
-            "text",
-            ""
-        ) or ""
-
-        corrected = corrected.strip()
-
-        if not corrected:
-            return text
-
-        if (
-            len(corrected) >= 2
-            and corrected[0] == '"'
-            and corrected[-1] == '"'
-        ):
-
-            corrected = (
-                corrected[1:-1]
-                .strip()
-            )
-
-        return corrected or text
-
-    except Exception as error:
-
-        print(
-            "Gemini text correction error:",
-            repr(error)
-        )
-
-        return text
-
-
-# ============================================================
-# REQUEST MODEL
-# ============================================================
-
-class CorrectTextRequest(BaseModel):
-
-    text: str = Field(
-        ...,
-        min_length=1,
-        max_length=500,
-        description=(
-            "Text produced by the "
-            "sign recognition system."
-        )
-    )
+        "supported_labels":
+            LABELS
+    }
 
 
 # ============================================================
@@ -696,56 +877,45 @@ async def health():
         "gemini_model":
             GEMINI_MODEL,
 
-        "labels":
-            len(LABELS),
+        "recognition_engine":
+            "Gemini Vision",
 
-        "input_size":
-            63,
+        "supported_labels":
+            len(LABELS),
 
         "confidence_threshold":
             CONFIDENCE_THRESHOLD,
 
-        "device":
-            "gemini-cloud",
-
-        "sign_recognition":
-            "Gemini Vision",
-
-        "text_correction":
-            "Gemini"
-
+        "max_image_size_mb":
+            MAX_IMAGE_BYTES / (
+                1024 * 1024
+            )
     }
 
 
 # ============================================================
-# ROOT
+# PREDICT SIGN
 # ============================================================
-
-@app.get("/")
-async def root():
-
-    return {
-
-        "message":
-            "Kaitexy AI Gemini Backend is running.",
-
-        "version":
-            APP_VERSION,
-
-        "health":
-            "/health",
-
-        "prediction_endpoint":
-            "/predict-sign",
-
-        "text_endpoint":
-            "/correct-text"
-
-    }
-
-
-# ============================================================
-# SIGN PREDICTION ENDPOINT
+#
+# THIS IS THE ENDPOINT USED BY YOUR CURRENT FLUTTER CODE.
+#
+# Flutter sends:
+#
+# POST
+# /predict-sign
+#
+# multipart:
+#
+# file = image
+#
+# Backend returns:
+#
+# {
+#     "prediction": "A",
+#     "confidence": 0.94,
+#     "status": "Prediction successful"
+# }
+#
 # ============================================================
 
 @app.post("/predict-sign")
@@ -753,13 +923,22 @@ async def predict_sign(
     file: UploadFile = File(...)
 ):
 
+    print()
+    print("=" * 70)
+    print("NEW SIGN PREDICTION REQUEST")
+    print("=" * 70)
+
     try:
 
-        # ----------------------------------------------------
-        # Gemini availability
-        # ----------------------------------------------------
+        # ====================================================
+        # 1. CHECK GEMINI
+        # ====================================================
 
         if not GEMINI_READY:
+
+            print(
+                "Gemini is not ready."
+            )
 
             return JSONResponse(
 
@@ -768,38 +947,31 @@ async def predict_sign(
                 content={
 
                     "prediction": "",
+
                     "confidence": 0.0,
+
                     "status":
                         "Gemini model not ready"
-
                 }
             )
 
-        # ----------------------------------------------------
-        # Validate image type
-        # ----------------------------------------------------
+        # ====================================================
+        # 2. CHECK MIME TYPE
+        # ====================================================
 
         content_type = (
             file.content_type or ""
         ).lower()
 
-        mime_map = {
+        print(
+            "Received MIME type:",
+            content_type
+        )
 
-            "image/jpeg":
-                "image/jpeg",
-
-            "image/jpg":
-                "image/jpeg",
-
-            "image/png":
-                "image/png",
-
-            "image/webp":
-                "image/webp"
-
-        }
-
-        if content_type not in mime_map:
+        if (
+            content_type
+            not in SUPPORTED_MIME_TYPES
+        ):
 
             return JSONResponse(
 
@@ -808,35 +980,59 @@ async def predict_sign(
                 content={
 
                     "prediction": "",
+
                     "confidence": 0.0,
+
                     "status":
                         "Unsupported image type"
-
                 }
             )
 
-        # ----------------------------------------------------
-        # Read image
-        # ----------------------------------------------------
+        mime_type = SUPPORTED_MIME_TYPES[
+            content_type
+        ]
+
+        # ====================================================
+        # 3. READ IMAGE
+        # ====================================================
 
         image_bytes = await file.read()
 
+        print(
+            "Image size:",
+            len(image_bytes),
+            "bytes"
+        )
+
+        # ====================================================
+        # 4. EMPTY IMAGE
+        # ====================================================
+
         if not image_bytes:
 
-            return {
+            return JSONResponse(
 
-                "prediction": "",
-                "confidence": 0.0,
-                "status":
-                    "Empty image"
+                status_code=400,
 
-            }
+                content={
 
-        # ----------------------------------------------------
-        # File size protection
-        # ----------------------------------------------------
+                    "prediction": "",
 
-        if len(image_bytes) > MAX_IMAGE_BYTES:
+                    "confidence": 0.0,
+
+                    "status":
+                        "Empty image"
+                }
+            )
+
+        # ====================================================
+        # 5. IMAGE SIZE
+        # ====================================================
+
+        if (
+            len(image_bytes)
+            > MAX_IMAGE_BYTES
+        ):
 
             return JSONResponse(
 
@@ -845,16 +1041,17 @@ async def predict_sign(
                 content={
 
                     "prediction": "",
+
                     "confidence": 0.0,
+
                     "status":
                         "Image too large"
-
                 }
             )
 
-        # ----------------------------------------------------
-        # Gemini recognition
-        # ----------------------------------------------------
+        # ====================================================
+        # 6. SEND IMAGE TO GEMINI
+        # ====================================================
 
         (
             letter,
@@ -864,17 +1061,28 @@ async def predict_sign(
 
             image_bytes,
 
-            mime_map[
-                content_type
-            ]
-
+            mime_type
         )
 
-        # ----------------------------------------------------
-        # No prediction
-        # ----------------------------------------------------
+        # ====================================================
+        # 7. GEMINI DID NOT RECOGNIZE
+        # ====================================================
 
         if letter is None:
+
+            print(
+                "No accepted prediction."
+            )
+
+            print(
+                "Confidence:",
+                confidence
+            )
+
+            print(
+                "Status:",
+                status
+            )
 
             return {
 
@@ -888,12 +1096,28 @@ async def predict_sign(
 
                 "status":
                     status
-
             }
 
-        # ----------------------------------------------------
-        # Successful prediction
-        # ----------------------------------------------------
+        # ====================================================
+        # 8. SUCCESS
+        # ====================================================
+
+        print(
+            "FINAL PREDICTION:",
+            letter
+        )
+
+        print(
+            "FINAL CONFIDENCE:",
+            confidence
+        )
+
+        print(
+            "FINAL STATUS:",
+            "Prediction successful"
+        )
+
+        print("=" * 70)
 
         return {
 
@@ -908,15 +1132,24 @@ async def predict_sign(
 
             "status":
                 "Prediction successful"
-
         }
+
+    # ========================================================
+    # GENERAL SERVER ERROR
+    # ========================================================
 
     except Exception as error:
 
+        print()
+        print("=" * 70)
+        print("PREDICTION ENDPOINT ERROR")
+        print("=" * 70)
+
         print(
-            "Predict endpoint error:",
             repr(error)
         )
+
+        print("=" * 70)
 
         return JSONResponse(
 
@@ -925,104 +1158,23 @@ async def predict_sign(
             content={
 
                 "prediction": "",
+
                 "confidence": 0.0,
+
                 "status":
                     "Server error",
+
                 "error":
                     str(error)
-
             }
         )
 
 
 # ============================================================
-# TEXT CORRECTION ENDPOINT
+# RENDER
 # ============================================================
-
-@app.post("/correct-text")
-async def correct_text(
-    request: CorrectTextRequest
-):
-
-    raw_text = (
-        request.text.strip()
-    )
-
-    if not raw_text:
-
-        return {
-
-            "raw_text": "",
-            "corrected_text": "",
-            "status":
-                "Empty text"
-
-        }
-
-    if not GEMINI_READY:
-
-        return {
-
-            "raw_text":
-                raw_text,
-
-            "corrected_text":
-                raw_text,
-
-            "status":
-                "Gemini unavailable; "
-                "original text returned"
-
-        }
-
-    try:
-
-        corrected = (
-            await correct_text_gemini(
-                raw_text
-            )
-        )
-
-        return {
-
-            "raw_text":
-                raw_text,
-
-            "corrected_text":
-                corrected,
-
-            "status":
-                "Text corrected successfully"
-
-        }
-
-    except Exception as error:
-
-        print(
-            "Text correction endpoint error:",
-            repr(error)
-        )
-
-        return {
-
-            "raw_text":
-                raw_text,
-
-            "corrected_text":
-                raw_text,
-
-            "status":
-                "Correction failed",
-
-            "error":
-                str(error)
-
-        }
-
-
-# ============================================================
-# RENDER START COMMAND
-# ============================================================
+#
+# Render start command:
 #
 # uvicorn main:app --host 0.0.0.0 --port $PORT
 #
