@@ -1,75 +1,35 @@
 # ============================================================
-# KAITEXY AI - SIGN LANGUAGE BACKEND
+# KAITEXY AI - GEMINI SIGN LANGUAGE BACKEND
 # ============================================================
-#
-# Architecture:
 #
 # Flutter
 #    ↓
 # FastAPI
 #    ↓
-# MediaPipe Hand Landmarks
+# Gemini Vision
 #    ↓
-# 63 Features
-#    ↓
-# PyTorch Sign Classifier
-#    ↓
-# Prediction + Confidence
+# Sign prediction
 #    ↓
 # Flutter builds text
 #    ↓
 # /correct-text
 #    ↓
-# FLAN-T5-small (lazy loaded)
-#
-# Optimized for:
-#   - Render
-#   - CPU-only deployment
-#   - Low RAM environments
-#   - Low persistent storage
-#   - Fast startup
+# Gemini text correction
 #
 # ============================================================
 
 import asyncio
-import gc
 import os
-from contextlib import asynccontextmanager
-from typing import Optional
-
-# ------------------------------------------------------------
-# Hugging Face cache
-# ------------------------------------------------------------
-# Keep downloaded HF files in a temporary/runtime directory.
-# This avoids filling the application filesystem unnecessarily.
-os.environ.setdefault("HF_HOME", "/tmp/huggingface")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/huggingface/transformers")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-import cv2
-import mediapipe as mp
-import numpy as np
-import torch
-import torch.nn as nn
+import re
+from typing import Optional, Literal
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-
-# ============================================================
-# PERFORMANCE / MEMORY SETTINGS
-# ============================================================
-
-# Render CPU instances usually have limited memory.
-# Restricting PyTorch threads prevents excessive RAM usage.
-try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-except Exception:
-    pass
+from google import genai
+from google.genai import types
 
 
 # ============================================================
@@ -77,31 +37,19 @@ except Exception:
 # ============================================================
 
 APP_NAME = "Kaitexy AI Sign Language Backend"
-APP_VERSION = "6.1"
+APP_VERSION = "7.2-GEMINI"
 
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+).strip()
 
-# ============================================================
-# PATHS
-# ============================================================
-
-MODEL_PATH = os.getenv(
-    "SIGN_MODEL_PATH",
-    "model/sign_model.pt"
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.6-flash"
 )
 
-
-# ============================================================
-# SIGN MODEL CONFIGURATION
-# ============================================================
-
-INPUT_SIZE = 63
-
-# IMPORTANT:
-# These labels MUST match the exact class ordering used
-# when sign_model.pt was trained.
 LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-NUM_CLASSES = len(LABELS)
 
 CONFIDENCE_THRESHOLD = float(
     os.getenv(
@@ -110,179 +58,45 @@ CONFIDENCE_THRESHOLD = float(
     )
 )
 
-
-# ============================================================
-# IMAGE CONFIGURATION
-# ============================================================
-
-IMAGE_WIDTH = 160
-IMAGE_HEIGHT = 120
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 
 # ============================================================
-# MEDIAPIPE CONFIGURATION
+# GEMINI CLIENT
 # ============================================================
 
-MAX_NUM_HANDS = 1
-MODEL_COMPLEXITY = 0
+gemini_client: Optional[genai.Client] = None
 
-MIN_DETECTION_CONFIDENCE = 0.5
-MIN_TRACKING_CONFIDENCE = 0.5
+GEMINI_READY = False
 
 
-# ============================================================
-# FLAN-T5 CONFIGURATION
-# ============================================================
+def initialize_gemini() -> bool:
 
-FLAN_MODEL_NAME = os.getenv(
-    "FLAN_MODEL_NAME",
-    "google/flan-t5-small"
-)
-
-FLAN_MAX_NEW_TOKENS = 40
-FLAN_NUM_BEAMS = 1
-
-# If True, FLAN-T5 is removed from RAM after every correction.
-# This saves RAM but makes the next correction slower.
-UNLOAD_FLAN_AFTER_REQUEST = os.getenv(
-    "UNLOAD_FLAN_AFTER_REQUEST",
-    "true"
-).lower() == "true"
-
-
-# ============================================================
-# DEVICE
-# ============================================================
-
-DEVICE = torch.device("cpu")
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-sign_model: Optional[nn.Module] = None
-
-flan_tokenizer = None
-flan_model = None
-
-hands = None
-
-SIGN_MODEL_READY = False
-FLAN_READY = False
-
-# Prevent multiple requests from loading FLAN-T5 simultaneously.
-flan_lock = asyncio.Lock()
-
-
-# ============================================================
-# PYTORCH SIGN MODEL
-# ============================================================
-
-class SignModel(nn.Module):
-    """
-    Neural network architecture used during training.
-
-    IMPORTANT:
-    This architecture MUST exactly match the architecture
-    used to create sign_model.pt.
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        num_classes: int
-    ):
-        super().__init__()
-
-        self.model = nn.Sequential(
-            nn.Linear(input_size, 256),
-
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-
-            nn.Dropout(0.3),
-
-            nn.Linear(256, 128),
-
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.Dropout(0.3),
-
-            nn.Linear(128, 64),
-            nn.ReLU(),
-
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-
-# ============================================================
-# LOAD SIGN MODEL
-# ============================================================
-
-def load_sign_model() -> bool:
-
-    global sign_model
-    global SIGN_MODEL_READY
+    global gemini_client
+    global GEMINI_READY
 
     try:
 
-        if not os.path.isfile(MODEL_PATH):
+        if not GEMINI_API_KEY:
 
             print(
-                f"Sign model not found: {MODEL_PATH}"
+                "ERROR: GEMINI_API_KEY environment "
+                "variable is missing."
             )
 
-            SIGN_MODEL_READY = False
+            GEMINI_READY = False
+
             return False
 
-        print(
-            f"Loading sign model: {MODEL_PATH}"
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
 
-        model = SignModel(
-            input_size=INPUT_SIZE,
-            num_classes=NUM_CLASSES
-        )
-
-        # ----------------------------------------------------
-        # Load weights directly into CPU memory.
-        # ----------------------------------------------------
-
-        try:
-
-            state_dict = torch.load(
-                MODEL_PATH,
-                map_location="cpu",
-                weights_only=True
-            )
-
-        except TypeError:
-
-            # Compatibility with older PyTorch.
-            state_dict = torch.load(
-                MODEL_PATH,
-                map_location="cpu"
-            )
-
-        model.load_state_dict(state_dict)
-
-        del state_dict
-        gc.collect()
-
-        model.to(DEVICE)
-        model.eval()
-
-        sign_model = model
-        SIGN_MODEL_READY = True
+        GEMINI_READY = True
 
         print(
-            "Sign model loaded successfully "
-            f"({NUM_CLASSES} classes)."
+            f"Gemini initialized successfully: "
+            f"{GEMINI_MODEL}"
         )
 
         return True
@@ -290,229 +104,14 @@ def load_sign_model() -> bool:
     except Exception as error:
 
         print(
-            f"Sign model loading error: {error}"
+            "Gemini initialization error:",
+            repr(error)
         )
 
-        sign_model = None
-        SIGN_MODEL_READY = False
-
-        gc.collect()
+        gemini_client = None
+        GEMINI_READY = False
 
         return False
-
-
-# ============================================================
-# INITIALIZE MEDIAPIPE
-# ============================================================
-
-def initialize_mediapipe() -> bool:
-
-    global hands
-
-    try:
-
-        mp_hands = mp.solutions.hands
-
-        hands = mp_hands.Hands(
-            static_image_mode=True,
-            max_num_hands=MAX_NUM_HANDS,
-            model_complexity=MODEL_COMPLEXITY,
-            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
-        )
-
-        print(
-            "MediaPipe Hands initialized."
-        )
-
-        return True
-
-    except Exception as error:
-
-        print(
-            f"MediaPipe initialization error: {error}"
-        )
-
-        hands = None
-
-        return False
-
-
-# ============================================================
-# LOAD FLAN-T5 LAZILY
-# ============================================================
-
-def load_flan_model() -> bool:
-
-    global flan_tokenizer
-    global flan_model
-    global FLAN_READY
-
-    try:
-
-        # ----------------------------------------------------
-        # Don't load it twice.
-        # ----------------------------------------------------
-
-        if (
-            FLAN_READY
-            and flan_model is not None
-            and flan_tokenizer is not None
-        ):
-            return True
-
-        print(
-            f"Loading language model: "
-            f"{FLAN_MODEL_NAME}"
-        )
-
-        # ----------------------------------------------------
-        # Tokenizer
-        # ----------------------------------------------------
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            FLAN_MODEL_NAME,
-            use_fast=True
-        )
-
-        # ----------------------------------------------------
-        # Model
-        #
-        # low_cpu_mem_usage=True prevents unnecessary
-        # temporary copies during model loading.
-        # ----------------------------------------------------
-
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            FLAN_MODEL_NAME,
-            low_cpu_mem_usage=True
-        )
-
-        model.to(DEVICE)
-        model.eval()
-
-        flan_tokenizer = tokenizer
-        flan_model = model
-
-        FLAN_READY = True
-
-        print(
-            "FLAN-T5 initialized successfully."
-        )
-
-        return True
-
-    except Exception as error:
-
-        print(
-            f"FLAN-T5 loading failed: {error}"
-        )
-
-        flan_tokenizer = None
-        flan_model = None
-        FLAN_READY = False
-
-        gc.collect()
-
-        return False
-
-
-# ============================================================
-# UNLOAD FLAN-T5
-# ============================================================
-
-def unload_flan_model():
-
-    global flan_tokenizer
-    global flan_model
-    global FLAN_READY
-
-    try:
-
-        print(
-            "Unloading FLAN-T5 from memory..."
-        )
-
-        flan_model = None
-        flan_tokenizer = None
-
-        FLAN_READY = False
-
-        gc.collect()
-
-        print(
-            "FLAN-T5 unloaded."
-        )
-
-    except Exception as error:
-
-        print(
-            f"FLAN unload error: {error}"
-        )
-
-
-# ============================================================
-# STARTUP / SHUTDOWN
-# ============================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    print("=" * 60)
-    print("Starting Kaitexy AI Backend")
-    print("=" * 60)
-
-    # --------------------------------------------------------
-    # CORE COMPONENTS ONLY
-    # --------------------------------------------------------
-    #
-    # FLAN-T5 is intentionally NOT loaded here.
-    #
-    # This dramatically reduces startup RAM usage.
-    # --------------------------------------------------------
-
-    load_sign_model()
-
-    initialize_mediapipe()
-
-    print(
-        "FLAN-T5 will be loaded only when "
-        "/correct-text is requested."
-    )
-
-    print("=" * 60)
-    print("Kaitexy AI Backend startup complete")
-    print("=" * 60)
-
-    yield
-
-    # --------------------------------------------------------
-    # SHUTDOWN
-    # --------------------------------------------------------
-
-    global hands
-    global sign_model
-
-    print(
-        "Shutting down Kaitexy AI..."
-    )
-
-    if hands is not None:
-
-        try:
-            hands.close()
-        except Exception:
-            pass
-
-    hands = None
-    sign_model = None
-
-    unload_flan_model()
-
-    gc.collect()
-
-    print(
-        "Shutdown complete."
-    )
 
 
 # ============================================================
@@ -524,9 +123,8 @@ app = FastAPI(
     version=APP_VERSION,
     description=(
         "AI-powered sign language recognition "
-        "backend for Kaitexy AI."
+        "backend using Gemini Vision."
     ),
-    lifespan=lifespan,
 )
 
 
@@ -552,280 +150,516 @@ app.add_middleware(
 
 
 # ============================================================
-# LANDMARK EXTRACTION
+# STARTUP
 # ============================================================
 
-def extract_landmarks(
-    image_bytes: bytes
-):
+@app.on_event("startup")
+async def startup_event():
 
-    if hands is None:
-        return None
+    print("=" * 60)
+    print("Starting Kaitexy AI Gemini Backend")
+    print("=" * 60)
 
-    try:
+    initialize_gemini()
 
-        # ----------------------------------------------------
-        # Bytes → NumPy
-        # ----------------------------------------------------
+    print("=" * 60)
 
-        image_array = np.frombuffer(
-            image_bytes,
-            dtype=np.uint8
-        )
-
-        image = cv2.imdecode(
-            image_array,
-            cv2.IMREAD_COLOR
-        )
-
-        if image is None:
-            return None
-
-        # ----------------------------------------------------
-        # Resize
-        # ----------------------------------------------------
-
-        image = cv2.resize(
-            image,
-            (
-                IMAGE_WIDTH,
-                IMAGE_HEIGHT
-            ),
-            interpolation=cv2.INTER_AREA
-        )
-
-        # ----------------------------------------------------
-        # BGR → RGB
-        # ----------------------------------------------------
-
-        image_rgb = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB
-        )
-
-        # ----------------------------------------------------
-        # MediaPipe
-        # ----------------------------------------------------
-
-        results = hands.process(
-            image_rgb
-        )
-
-        if not results.multi_hand_landmarks:
-            return None
-
-        hand_landmarks = (
-            results.multi_hand_landmarks[0]
-        )
-
-        features = []
-
-        for landmark in hand_landmarks.landmark:
-
-            features.extend([
-                landmark.x,
-                landmark.y,
-                landmark.z
-            ])
-
-        if len(features) != INPUT_SIZE:
-            return None
-
-        return np.asarray(
-            features,
-            dtype=np.float32
-        )
-
-    except Exception as error:
-
+    if GEMINI_READY:
         print(
-            f"Landmark extraction error: {error}"
+            "Kaitexy AI Gemini Backend READY"
+        )
+    else:
+        print(
+            "WARNING: Gemini is NOT ready"
         )
 
-        return None
+    print("=" * 60)
 
 
 # ============================================================
-# SIGN PREDICTION
+# SHUTDOWN
 # ============================================================
 
-def predict_landmarks(
-    landmarks: np.ndarray
+@app.on_event("shutdown")
+async def shutdown_event():
+
+    global gemini_client
+    global GEMINI_READY
+
+    print(
+        "Shutting down Kaitexy AI..."
+    )
+
+    gemini_client = None
+    GEMINI_READY = False
+
+
+# ============================================================
+# GEMINI RESPONSE MODEL
+# ============================================================
+
+class SignResult(BaseModel):
+
+    prediction: Literal[
+        "A", "B", "C", "D", "E", "F",
+        "G", "H", "I", "J", "K", "L",
+        "M", "N", "O", "P", "Q", "R",
+        "S", "T", "U", "V", "W", "X",
+        "Y", "Z", "UNKNOWN"
+    ] = Field(
+        description=(
+            "One uppercase ASL alphabet letter "
+            "from A to Z, or UNKNOWN."
+        )
+    )
+
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Recognition confidence from "
+            "0.0 to 1.0."
+        )
+    )
+
+
+# ============================================================
+# SIGN RECOGNITION PROMPT
+# ============================================================
+
+SIGN_PROMPT = """
+You are the vision recognition engine for Kaitexy AI.
+
+Your ONLY task is to recognize ONE STATIC ASL
+FINGERSPELLING ALPHABET LETTER from the provided image.
+
+Allowed letters:
+
+A B C D E F G H I J K L M
+N O P Q R S T U V W X Y Z
+
+Analyze ONLY the visible hand and fingers.
+
+IMPORTANT RULES:
+
+1. Identify the hand shape carefully.
+2. Pay attention to finger position.
+3. Pay attention to thumb position.
+4. Pay attention to finger separation.
+5. Pay attention to palm orientation.
+6. Ignore the person's face.
+7. Ignore clothing.
+8. Ignore the background.
+9. Ignore written text.
+10. Ignore objects that are not part of the hand.
+11. Do not return a word.
+12. Do not return multiple letters.
+13. Return exactly ONE letter when sufficiently clear.
+14. If the hand is not visible, badly cropped, or genuinely
+    impossible to identify, return UNKNOWN.
+15. Do not invent a letter.
+16. This is STATIC ASL FINGERSPELLING.
+
+Confidence must be between 0.0 and 1.0.
+
+Return ONLY the structured response requested by the API.
+"""
+
+
+# ============================================================
+# NORMALIZE PREDICTION
+# ============================================================
+
+def normalize_prediction(
+    prediction: object,
+    confidence: object
 ):
 
-    if (
-        not SIGN_MODEL_READY
-        or sign_model is None
+    if not isinstance(
+        prediction,
+        str
     ):
         return None, 0.0
 
+    prediction = prediction.strip().upper()
+
     try:
 
-        if landmarks is None:
-            return None, 0.0
-
-        landmarks = np.asarray(
-            landmarks,
-            dtype=np.float32
-        )
-
-        if landmarks.shape != (
-            INPUT_SIZE,
-        ):
-            return None, 0.0
-
-        tensor = torch.from_numpy(
-            landmarks
-        ).unsqueeze(0)
-
-        with torch.inference_mode():
-
-            logits = sign_model(
-                tensor
-            )
-
-            probabilities = torch.softmax(
-                logits,
-                dim=1
-            )
-
-            confidence, prediction = (
-                torch.max(
-                    probabilities,
-                    dim=1
-                )
-            )
-
-        index = int(
-            prediction.item()
-        )
-
         score = float(
-            confidence.item()
+            confidence
         )
 
-        if (
-            index < 0
-            or index >= len(LABELS)
-        ):
-            return None, 0.0
+    except Exception:
 
-        if (
+        score = 0.0
+
+    score = max(
+        0.0,
+        min(
+            1.0,
             score
-            < CONFIDENCE_THRESHOLD
-        ):
-            return None, score
+        )
+    )
+
+    if prediction == "UNKNOWN":
+
+        return None, score
+
+    prediction = re.sub(
+        r"[^A-Z]",
+        "",
+        prediction
+    )
+
+    if (
+        len(prediction) != 1
+        or prediction not in LABELS
+    ):
+
+        return None, score
+
+    return prediction, score
+
+
+# ============================================================
+# GEMINI SIGN RECOGNITION
+# ============================================================
+
+async def recognize_sign(
+    image_bytes: bytes,
+    mime_type: str
+):
+
+    if not GEMINI_READY:
 
         return (
-            LABELS[index],
-            score
+            None,
+            0.0,
+            "Gemini unavailable"
+        )
+
+    try:
+
+        # ----------------------------------------------------
+        # Image
+        # ----------------------------------------------------
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type=mime_type
+        )
+
+        # ----------------------------------------------------
+        # Gemini request
+        # ----------------------------------------------------
+
+        response = await asyncio.to_thread(
+
+            gemini_client.models.generate_content,
+
+            model=GEMINI_MODEL,
+
+            contents=[
+                image_part,
+                SIGN_PROMPT
+            ],
+
+            config=types.GenerateContentConfig(
+
+                # Structured JSON
+                response_mime_type="application/json",
+
+                response_schema=SignResult,
+
+                # Give the model enough room.
+                max_output_tokens=100,
+
+                # Keep reasoning minimal for speed.
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
+
+                # Prevent tools / automatic function behavior.
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                )
+            )
+        )
+
+        # ----------------------------------------------------
+        # Diagnostics
+        # ----------------------------------------------------
+
+        print("=" * 60)
+        print("GEMINI RESPONSE RECEIVED")
+        print("=" * 60)
+
+        raw_text = getattr(
+            response,
+            "text",
+            ""
+        ) or ""
+
+        print(
+            "RAW TEXT:",
+            repr(raw_text)
+        )
+
+        # ----------------------------------------------------
+        # BEST METHOD:
+        # Use SDK parsed structured response.
+        # ----------------------------------------------------
+
+        parsed = getattr(
+            response,
+            "parsed",
+            None
+        )
+
+        if parsed is not None:
+
+            print(
+                "PARSED RESPONSE:",
+                repr(parsed)
+            )
+
+            prediction = getattr(
+                parsed,
+                "prediction",
+                None
+            )
+
+            confidence = getattr(
+                parsed,
+                "confidence",
+                0.0
+            )
+
+            letter, score = normalize_prediction(
+                prediction,
+                confidence
+            )
+
+            if letter is None:
+
+                return (
+                    None,
+                    score,
+                    "Gesture not confidently recognized"
+                )
+
+            if score < CONFIDENCE_THRESHOLD:
+
+                return (
+                    None,
+                    score,
+                    "Low confidence"
+                )
+
+            return (
+                letter,
+                score,
+                "Prediction successful"
+            )
+
+        # ----------------------------------------------------
+        # FALLBACK:
+        # Parse raw JSON if SDK did not populate .parsed.
+        # ----------------------------------------------------
+
+        if raw_text:
+
+            import json
+
+            try:
+
+                data = json.loads(
+                    raw_text
+                )
+
+                prediction = data.get(
+                    "prediction"
+                )
+
+                confidence = data.get(
+                    "confidence",
+                    0.0
+                )
+
+                letter, score = normalize_prediction(
+                    prediction,
+                    confidence
+                )
+
+                if letter is None:
+
+                    return (
+                        None,
+                        score,
+                        "Gesture not confidently recognized"
+                    )
+
+                if score < CONFIDENCE_THRESHOLD:
+
+                    return (
+                        None,
+                        score,
+                        "Low confidence"
+                    )
+
+                return (
+                    letter,
+                    score,
+                    "Prediction successful"
+                )
+
+            except Exception as parse_error:
+
+                print(
+                    "JSON parsing error:",
+                    repr(parse_error)
+                )
+
+        # ----------------------------------------------------
+        # Empty / incomplete response.
+        # ----------------------------------------------------
+
+        print(
+            "Gemini returned no complete structured response."
+        )
+
+        return (
+            None,
+            0.0,
+            "Invalid Gemini response"
         )
 
     except Exception as error:
 
+        print("=" * 60)
         print(
-            f"PyTorch prediction error: "
-            f"{error}"
+            "GEMINI SIGN RECOGNITION ERROR"
+        )
+        print("=" * 60)
+
+        print(
+            repr(error)
         )
 
-        return None, 0.0
+        print("=" * 60)
+
+        return (
+            None,
+            0.0,
+            "Gemini recognition failed"
+        )
 
 
 # ============================================================
-# FLAN TEXT CORRECTION
+# TEXT CORRECTION PROMPT
 # ============================================================
 
-def correct_text_flan(
+TEXT_CORRECTION_PROMPT = """
+You are the language correction engine for Kaitexy AI.
+
+Correct the spelling and grammar of the supplied sentence.
+
+Rules:
+
+1. Preserve the original meaning.
+2. Do not add information.
+3. Do not remove important information.
+4. Do not invent words.
+5. Keep the sentence natural.
+6. Return ONLY the corrected sentence.
+7. Do not explain your changes.
+
+Text:
+"""
+
+
+# ============================================================
+# GEMINI TEXT CORRECTION
+# ============================================================
+
+async def correct_text_gemini(
     text: str
 ) -> str:
 
     if not text:
         return ""
 
-    text = text.strip()
-
-    if not text:
-        return ""
-
-    if not FLAN_READY:
+    if not GEMINI_READY:
         return text
 
     try:
 
         prompt = (
-            "Correct the spelling and grammar "
-            "of the sentence. "
-            "Preserve the original meaning. "
-            "Do not add new information. "
-            "Do not remove important information. "
-            "Return only the corrected sentence.\n\n"
-            f"Sentence: {text}"
+            TEXT_CORRECTION_PROMPT
+            + text.strip()
         )
 
-        # ----------------------------------------------------
-        # Tokenization
-        # ----------------------------------------------------
+        response = await asyncio.to_thread(
 
-        inputs = flan_tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=128
-        )
+            gemini_client.models.generate_content,
 
-        # ----------------------------------------------------
-        # CPU inference
-        # ----------------------------------------------------
+            model=GEMINI_MODEL,
 
-        with torch.inference_mode():
+            contents=prompt,
 
-            output_tokens = (
-                flan_model.generate(
-                    **inputs,
-                    max_new_tokens=FLAN_MAX_NEW_TOKENS,
-                    num_beams=FLAN_NUM_BEAMS,
-                    do_sample=False,
-                    early_stopping=True,
+            config=types.GenerateContentConfig(
+
+                max_output_tokens=100,
+
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
+
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 )
             )
-
-        corrected = (
-            flan_tokenizer.decode(
-                output_tokens[0],
-                skip_special_tokens=True
-            )
-            .strip()
         )
 
-        del inputs
-        del output_tokens
+        corrected = getattr(
+            response,
+            "text",
+            ""
+        ) or ""
 
-        gc.collect()
+        corrected = corrected.strip()
 
         if not corrected:
             return text
 
-        return corrected
+        if (
+            len(corrected) >= 2
+            and corrected[0] == '"'
+            and corrected[-1] == '"'
+        ):
+
+            corrected = (
+                corrected[1:-1]
+                .strip()
+            )
+
+        return corrected or text
 
     except Exception as error:
 
         print(
-            f"FLAN correction error: "
-            f"{error}"
+            "Gemini text correction error:",
+            repr(error)
         )
-
-        gc.collect()
 
         return text
 
 
 # ============================================================
-# REQUEST MODELS
+# REQUEST MODEL
 # ============================================================
 
-class CorrectTextRequest(
-    BaseModel
-):
+class CorrectTextRequest(BaseModel):
 
     text: str = Field(
         ...,
@@ -847,35 +681,38 @@ async def health():
 
     return {
 
-        "status": "healthy",
+        "status":
+            "healthy",
 
-        "service": APP_NAME,
+        "service":
+            APP_NAME,
 
-        "version": APP_VERSION,
+        "version":
+            APP_VERSION,
 
-        "sign_model_ready":
-            SIGN_MODEL_READY,
+        "gemini_ready":
+            GEMINI_READY,
 
-        "flan_loaded":
-            FLAN_READY,
+        "gemini_model":
+            GEMINI_MODEL,
 
         "labels":
             len(LABELS),
 
         "input_size":
-            INPUT_SIZE,
+            63,
 
         "confidence_threshold":
             CONFIDENCE_THRESHOLD,
 
         "device":
-            str(DEVICE),
+            "gemini-cloud",
 
-        "flan_model":
-            FLAN_MODEL_NAME,
+        "sign_recognition":
+            "Gemini Vision",
 
-        "flan_lazy_loading":
-            True,
+        "text_correction":
+            "Gemini"
 
     }
 
@@ -890,7 +727,7 @@ async def root():
     return {
 
         "message":
-            "Kaitexy AI Backend is running.",
+            "Kaitexy AI Gemini Backend is running.",
 
         "version":
             APP_VERSION,
@@ -902,7 +739,7 @@ async def root():
             "/predict-sign",
 
         "text_endpoint":
-            "/correct-text",
+            "/correct-text"
 
     }
 
@@ -919,48 +756,62 @@ async def predict_sign(
     try:
 
         # ----------------------------------------------------
-        # Model check
+        # Gemini availability
         # ----------------------------------------------------
 
-        if not SIGN_MODEL_READY:
+        if not GEMINI_READY:
 
             return JSONResponse(
+
                 status_code=503,
+
                 content={
+
                     "prediction": "",
                     "confidence": 0.0,
                     "status":
-                        "Sign model not ready"
+                        "Gemini model not ready"
+
                 }
             )
 
         # ----------------------------------------------------
-        # File type validation
+        # Validate image type
         # ----------------------------------------------------
 
         content_type = (
             file.content_type or ""
-        )
+        ).lower()
 
-        allowed_types = {
-            "image/jpeg",
-            "image/png",
-            "image/webp",
-            "image/jpg",
+        mime_map = {
+
+            "image/jpeg":
+                "image/jpeg",
+
+            "image/jpg":
+                "image/jpeg",
+
+            "image/png":
+                "image/png",
+
+            "image/webp":
+                "image/webp"
+
         }
 
-        if (
-            content_type
-            not in allowed_types
-        ):
+        if content_type not in mime_map:
 
             return JSONResponse(
+
                 status_code=400,
+
                 content={
+
                     "prediction": "",
                     "confidence": 0.0,
                     "status":
                         "Unsupported image type"
+
                 }
             )
 
@@ -968,74 +819,80 @@ async def predict_sign(
         # Read image
         # ----------------------------------------------------
 
-        image_bytes = (
-            await file.read()
-        )
+        image_bytes = await file.read()
 
         if not image_bytes:
 
             return {
+
                 "prediction": "",
                 "confidence": 0.0,
                 "status":
                     "Empty image"
+
             }
 
         # ----------------------------------------------------
-        # Landmark extraction
+        # File size protection
         # ----------------------------------------------------
 
-        landmarks = (
-            await asyncio.to_thread(
-                extract_landmarks,
-                image_bytes
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+
+            return JSONResponse(
+
+                status_code=413,
+
+                content={
+
+                    "prediction": "",
+                    "confidence": 0.0,
+                    "status":
+                        "Image too large"
+
+                }
             )
+
+        # ----------------------------------------------------
+        # Gemini recognition
+        # ----------------------------------------------------
+
+        (
+            letter,
+            confidence,
+            status
+        ) = await recognize_sign(
+
+            image_bytes,
+
+            mime_map[
+                content_type
+            ]
+
         )
 
-        # Release image bytes as soon as possible.
-        del image_bytes
-
-        if landmarks is None:
-
-            return {
-                "prediction": "",
-                "confidence": 0.0,
-                "status":
-                    "No hand detected"
-            }
-
         # ----------------------------------------------------
-        # Prediction
-        # ----------------------------------------------------
-
-        letter, confidence = (
-            await asyncio.to_thread(
-                predict_landmarks,
-                landmarks
-            )
-        )
-
-        del landmarks
-
-        # ----------------------------------------------------
-        # Low confidence
+        # No prediction
         # ----------------------------------------------------
 
         if letter is None:
 
             return {
+
                 "prediction": "",
+
                 "confidence":
                     round(
                         confidence,
                         4
                     ),
+
                 "status":
-                    "Low confidence"
+                    status
+
             }
 
         # ----------------------------------------------------
-        # Success
+        # Successful prediction
         # ----------------------------------------------------
 
         return {
@@ -1057,19 +914,23 @@ async def predict_sign(
     except Exception as error:
 
         print(
-            f"Predict endpoint error: "
-            f"{error}"
+            "Predict endpoint error:",
+            repr(error)
         )
 
         return JSONResponse(
+
             status_code=500,
+
             content={
+
                 "prediction": "",
                 "confidence": 0.0,
                 "status":
                     "Server error",
                 "error":
-                    str(error),
+                    str(error)
+
             }
         )
 
@@ -1090,131 +951,79 @@ async def correct_text(
     if not raw_text:
 
         return {
+
             "raw_text": "",
             "corrected_text": "",
             "status":
                 "Empty text"
+
         }
 
-    # --------------------------------------------------------
-    # Only one FLAN loading/inference operation at a time.
-    # This prevents multiple simultaneous requests from
-    # creating multiple large memory allocations.
-    # --------------------------------------------------------
+    if not GEMINI_READY:
 
-    async with flan_lock:
+        return {
 
-        try:
+            "raw_text":
+                raw_text,
 
-            # ------------------------------------------------
-            # Lazy load FLAN-T5.
-            #
-            # It is NOT loaded during application startup.
-            # ------------------------------------------------
+            "corrected_text":
+                raw_text,
 
-            if not FLAN_READY:
+            "status":
+                "Gemini unavailable; "
+                "original text returned"
 
-                loaded = (
-                    await asyncio.to_thread(
-                        load_flan_model
-                    )
-                )
+        }
 
-                if not loaded:
+    try:
 
-                    return {
-                        "raw_text":
-                            raw_text,
-
-                        "corrected_text":
-                            raw_text,
-
-                        "status":
-                            "FLAN unavailable; "
-                            "original text returned"
-                    }
-
-            # ------------------------------------------------
-            # Correct text
-            # ------------------------------------------------
-
-            corrected = (
-                await asyncio.to_thread(
-                    correct_text_flan,
-                    raw_text
-                )
+        corrected = (
+            await correct_text_gemini(
+                raw_text
             )
+        )
 
-            result = {
+        return {
 
-                "raw_text":
-                    raw_text,
+            "raw_text":
+                raw_text,
 
-                "corrected_text":
-                    corrected,
+            "corrected_text":
+                corrected,
 
-                "status":
-                    "Text corrected successfully"
+            "status":
+                "Text corrected successfully"
 
-            }
+        }
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # Unload FLAN after the request.
-            #
-            # This keeps Render RAM low.
-            # ------------------------------------------------
+    except Exception as error:
 
-            if UNLOAD_FLAN_AFTER_REQUEST:
+        print(
+            "Text correction endpoint error:",
+            repr(error)
+        )
 
-                await asyncio.to_thread(
-                    unload_flan_model
-                )
+        return {
 
-            return result
+            "raw_text":
+                raw_text,
 
-        except Exception as error:
+            "corrected_text":
+                raw_text,
 
-            print(
-                f"Text correction error: "
-                f"{error}"
-            )
+            "status":
+                "Correction failed",
 
-            # Try to release memory.
-            if UNLOAD_FLAN_AFTER_REQUEST:
+            "error":
+                str(error)
 
-                await asyncio.to_thread(
-                    unload_flan_model
-                )
-
-            return {
-
-                "raw_text":
-                    raw_text,
-
-                "corrected_text":
-                    raw_text,
-
-                "status":
-                    "Correction failed",
-
-                "error":
-                    str(error)
-
-            }
+        }
 
 
 # ============================================================
-# END
+# RENDER START COMMAND
 # ============================================================
-#
-# Render start command:
 #
 # uvicorn main:app --host 0.0.0.0 --port $PORT
-#
-# Local:
-#
-# uvicorn main:app --host 0.0.0.0 --port 8000
 #
 # ============================================================
