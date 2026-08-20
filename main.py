@@ -1,13 +1,13 @@
 # ============================================================
 # KAITEXY AI
-# GEMINI VISION 10-CLASS ASL SIGN LANGUAGE BACKEND
+# GEMINI VISION 10-CLASS SIGN LANGUAGE BACKEND
 # ============================================================
 #
 # Flutter
 #     |
 #     | POST /predict-sign
 #     | multipart/form-data
-#     | field = file
+#     | file = JPEG image
 #     v
 # FastAPI
 #     |
@@ -15,7 +15,7 @@
 # Gemini Vision
 #     |
 #     v
-# EXACTLY 10 CLASSES + UNKNOWN
+# 10-CLASS CLOSED-SET CLASSIFICATION
 #     |
 #     v
 # JSON
@@ -24,15 +24,13 @@
 #     "confidence": 0.94,
 #     "status": "Prediction successful"
 # }
-#     |
-#     v
-# Flutter
 #
-# NO PyTorch
-# NO MediaPipe
-# NO .pt MODEL
-# NO LANDMARKS
-# NO GENERAL WORD RECOGNITION
+# ============================================================
+# NO PYTORCH
+# NO MEDIAPIPE
+# NO .PT MODEL
+# NO 63 LANDMARKS
+# NO A-Z CLASSIFICATION
 #
 # ============================================================
 
@@ -53,12 +51,12 @@ from google.genai import types
 
 
 # ============================================================
-# APPLICATION CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-APP_NAME = "Kaitexy AI Gemini 10-Class Sign Recognition Backend"
+APP_NAME = "Kaitexy AI Gemini 10-Class Backend"
 
-APP_VERSION = "10.0-GEMINI-10CLASS"
+APP_VERSION = "10.1-GEMINI-10CLASS"
 
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
@@ -84,7 +82,7 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 # EXACT SUPPORTED CLASSES
 # ============================================================
 
-SUPPORTED_CLASSES = {
+SUPPORTED_CLASSES = [
     "hello",
     "please",
     "yes",
@@ -95,7 +93,11 @@ SUPPORTED_CLASSES = {
     "help",
     "good",
     "bye"
-}
+]
+
+SUPPORTED_CLASSES_SET = set(
+    SUPPORTED_CLASSES
+)
 
 
 # ============================================================
@@ -118,12 +120,12 @@ def initialize_gemini() -> bool:
 
     print()
     print("=" * 70)
-    print("INITIALIZING KAITEXY AI GEMINI")
+    print("INITIALIZING GEMINI")
     print("=" * 70)
 
     if not GEMINI_API_KEY:
 
-        print("ERROR: GEMINI_API_KEY is not configured.")
+        print("ERROR: GEMINI_API_KEY is not set.")
 
         gemini_client = None
         GEMINI_READY = False
@@ -139,13 +141,7 @@ def initialize_gemini() -> bool:
         GEMINI_READY = True
 
         print("Gemini initialized successfully.")
-        print(f"Gemini model: {GEMINI_MODEL}")
-
-        print()
-        print("SUPPORTED CLASSES:")
-
-        for item in SUPPORTED_CLASSES:
-            print(f"  - {item}")
+        print(f"Model: {GEMINI_MODEL}")
 
         print("=" * 70)
 
@@ -163,7 +159,7 @@ def initialize_gemini() -> bool:
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
@@ -174,7 +170,7 @@ app = FastAPI(
 
     description=(
         "Kaitexy AI closed-set 10-class "
-        "ASL sign recognition using Gemini Vision."
+        "sign language recognition using Gemini Vision."
     )
 )
 
@@ -225,6 +221,19 @@ async def startup_event():
 
         print("STATUS: GEMINI NOT READY")
 
+    print()
+
+    print("SUPPORTED CLASSES:")
+
+    for index, class_name in enumerate(
+        SUPPORTED_CLASSES,
+        start=1
+    ):
+
+        print(
+            f"{index:02d}. {class_name}"
+        )
+
     print("=" * 70)
     print()
 
@@ -239,23 +248,25 @@ async def shutdown_event():
     global gemini_client
     global GEMINI_READY
 
-    print("Shutting down Kaitexy AI...")
+    print(
+        "Shutting down Kaitexy AI..."
+    )
 
     gemini_client = None
+
     GEMINI_READY = False
 
 
 # ============================================================
-# GEMINI RESPONSE SCHEMA
+# GEMINI STRUCTURED RESPONSE
 # ============================================================
 
 class SignResult(BaseModel):
 
     prediction: str = Field(
         description=(
-            "Exactly one of: "
-            "hello, please, yes, thank you, sorry, no, "
-            "i love you, help, good, bye, UNKNOWN"
+            "Exactly one of the ten supported "
+            "class names, or UNKNOWN."
         )
     )
 
@@ -263,7 +274,8 @@ class SignResult(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Visual confidence from 0.0 to 1.0."
+            "Visual classification confidence "
+            "between 0.0 and 1.0."
         )
     )
 
@@ -277,22 +289,30 @@ SIGN_PROMPT = r"""
 SYSTEM ROLE
 
 You are Kaitexy AI's dedicated visual
-10-class American Sign Language recognition engine.
+sign-language classification engine.
 
 You are NOT a conversational assistant.
 
-You are NOT a general image captioning system.
+You are NOT an image captioning system.
 
-You MUST perform CLOSED-SET CLASSIFICATION.
+You are NOT allowed to invent a meaning.
 
-Your task is to identify the visible hand-sign
-from the supplied image.
+Your ONLY task is CLOSED-SET visual classification.
+
+The supplied image contains a hand gesture.
+
+Classify it into exactly ONE of the ten
+supported sign-language classes below.
+
+If the image does not provide enough visual
+evidence for one of those ten classes,
+return UNKNOWN.
 
 ============================================================
-ABSOLUTE CLASS RESTRICTION
+SUPPORTED CLASSES
 ============================================================
 
-You may ONLY return one of these exact values:
+The ONLY valid classes are:
 
 hello
 please
@@ -304,13 +324,10 @@ i love you
 help
 good
 bye
-UNKNOWN
 
-There are exactly 10 supported sign classes.
+There are NO other classes.
 
-UNKNOWN is the rejection class.
-
-NEVER output:
+Do not output:
 
 hi
 thanks
@@ -318,414 +335,489 @@ love
 goodbye
 okay
 stop
-water
 welcome
-come
-go
+water
+eat
+drink
+friend
+family
 etc.
 
-Even if another word appears visually plausible,
-it is NOT an allowed class.
-
 ============================================================
-CORE RULE
+ABSOLUTE CLOSED-SET RULE
 ============================================================
 
-Classify the VISIBLE HAND CONFIGURATION.
+You MUST compare the image ONLY against
+the ten supported classes.
 
-Do not infer the meaning from:
+Never introduce a new class.
 
-- clothing
-- background
-- facial expression
-- objects
-- assumptions
-- context
-- what the person might be saying
+Never substitute a synonym.
 
-Use visual evidence from the sign.
+Never use contextual reasoning to invent
+a class.
 
-Analyze the complete visible configuration.
+The final prediction must be:
+
+hello
+please
+yes
+thank you
+sorry
+no
+i love you
+help
+good
+bye
+
+or:
+
+UNKNOWN
 
 ============================================================
-VISUAL FEATURES
+VISUAL ANALYSIS
 ============================================================
 
-Carefully inspect:
+Analyze the complete visible gesture.
 
-1. Number of visible hands.
-2. Handshape.
+Consider:
+
+1. Number of hands.
+
+2. Hand shape.
+
 3. Finger configuration.
-4. Thumb configuration.
-5. Palm orientation.
-6. Wrist orientation.
-7. Hand orientation.
-8. Hand position relative to face.
-9. Hand position relative to chest.
-10. Contact between hands.
-11. Contact with face or chest.
-12. Relative position of both hands.
-13. Visible movement stage, if inferable.
-14. Overall gesture configuration.
 
-Never classify using only one finger.
+4. Thumb configuration.
+
+5. Palm orientation.
+
+6. Wrist orientation.
+
+7. Hand orientation.
+
+8. Hand position relative to the face.
+
+9. Hand position relative to the chest.
+
+10. Relationship between both hands.
+
+11. Contact between hands.
+
+12. Contact with face or body.
+
+13. Overall anatomical configuration.
+
+Do NOT classify based on one finger alone.
+
+Do NOT classify based only on the location of the hand.
+
+The complete gesture is more important than
+any individual feature.
 
 ============================================================
-SUPPORTED CLASS 1 — HELLO
+SINGLE IMAGE RULE
+============================================================
+
+The input is normally one photograph.
+
+You cannot reliably observe an entire movement
+sequence from one photograph.
+
+Therefore:
+
+Do not invent movement.
+
+Do not assume a movement that is not visible.
+
+Use the visible hand configuration and spatial
+relationship.
+
+If a sign normally involves movement, classify it
+only when the captured position provides sufficient
+evidence.
+
+Otherwise return UNKNOWN.
+
+============================================================
+CLASS 1 — HELLO
 ============================================================
 
 Typical ASL greeting.
 
-Look for an open/flat hand near the
-forehead/temple area with an outward-facing
-orientation and a greeting/salute-like configuration.
+Look for an open, flat hand with fingers
+generally extended together and the thumb
+naturally positioned.
 
-Do NOT classify every open hand near the face
+The hand is generally associated with a
+greeting/salute-like configuration near the
+forehead or temple.
+
+Do not classify every open hand near the face
 as hello.
 
 ============================================================
-SUPPORTED CLASS 2 — PLEASE
+CLASS 2 — PLEASE
 ============================================================
 
 Typical ASL "please".
 
-Look for an open/flat hand positioned
-against or near the upper chest.
+Usually an open, flat hand is placed against
+or near the upper chest.
 
-The configuration is associated with
-the chest-rubbing/circular movement.
+The palm generally faces toward the signer.
 
-In a single frame, use the visible handshape
-and chest relationship.
+The sign commonly involves rubbing/circular
+movement over the chest.
+
+In one frame, focus on:
+
+- open hand
+- chest location
+- palm orientation
+
+Do not classify an arbitrary open hand near
+the chest as please.
 
 ============================================================
-SUPPORTED CLASS 3 — YES
+CLASS 3 — YES
 ============================================================
 
 Typical ASL "yes".
 
-Look for a closed fist / S-like handshape.
+Look for an S-like fist configuration.
 
-The thumb is positioned across or near
-the curled fingers.
+The fingers are curled into a fist and the
+thumb participates in the closed handshape.
 
-Do NOT classify every fist as yes.
+Do not classify every fist as yes.
+
+The complete handshape must support yes.
 
 ============================================================
-SUPPORTED CLASS 4 — THANK YOU
+CLASS 4 — THANK YOU
 ============================================================
 
 Typical ASL "thank you".
 
-Look for a flat/open hand near the
-chin or mouth area.
+Look for a flat/open hand near the chin or mouth.
 
-The gesture is normally associated with
-moving the hand away from the face.
+The palm generally faces toward the signer.
 
-Use the exact position and orientation.
+The hand is associated with movement away from
+the face.
+
+Do not classify every open hand near the face
+as thank you.
 
 ============================================================
-SUPPORTED CLASS 5 — SORRY
+CLASS 5 — SORRY
 ============================================================
 
 Typical ASL "sorry".
 
-Look for an A-like closed hand/fist
-with the thumb positioned along the
-fingers.
+Look for an A-like closed handshape.
 
-The hand is generally associated with
-the chest.
+The thumb is positioned along/against the
+curled fingers.
 
-Do NOT classify every fist near the chest
-as sorry.
+The hand is generally near or against the chest.
+
+The sign commonly involves circular movement
+over the chest.
+
+Require both:
+
+- appropriate handshape
+- appropriate body location
 
 ============================================================
-SUPPORTED CLASS 6 — NO
+CLASS 6 — NO
 ============================================================
 
 Typical ASL "no".
 
-Look for the characteristic configuration
-involving the index finger, middle finger,
-and thumb.
+Look for the characteristic interaction
+between:
 
-The index and middle fingers work with
-the thumb in a closing/pinching configuration.
+- index finger
+- middle finger
+- thumb
 
-Do NOT classify an arbitrary two-finger
-gesture as no.
+The fingers and thumb form a closing/pinching
+configuration.
+
+Do not classify every two-finger gesture as no.
 
 ============================================================
-SUPPORTED CLASS 7 — I LOVE YOU
+CLASS 7 — I LOVE YOU
 ============================================================
 
 Typical ASL ILY handshape.
 
-Three digits must be extended simultaneously:
+The following three digits are extended:
 
 - thumb
 - index finger
 - pinky finger
 
-Middle and ring fingers should be curled.
+While:
 
-The simultaneous thumb + index + pinky
-configuration is critical.
+- middle finger is curled
+- ring finger is curled
 
-Do NOT confuse with:
+The combination is critical.
+
+Do not confuse it with:
 
 - pointing
-- rock-and-roll
-- three-finger gestures
+- rock gesture
+- ordinary three-finger gesture
 - open hand
 
 ============================================================
-SUPPORTED CLASS 8 — HELP
+CLASS 8 — HELP
 ============================================================
 
 Typical ASL "help".
 
-Usually two hands are visible.
+Usually involves TWO hands.
 
 One hand forms an A-like/fist configuration.
 
 The other hand is open/flat and supports
-the first hand from underneath.
+the first hand underneath.
 
 The relationship between the two hands
-is critical.
+is essential.
 
-If the required two-hand relationship
-cannot be determined, prefer UNKNOWN.
+If the second hand is required but not visible,
+prefer UNKNOWN.
 
 ============================================================
-SUPPORTED CLASS 9 — GOOD
+CLASS 9 — GOOD
 ============================================================
 
 Typical ASL "good".
 
-Usually an open/flat hand begins near
-the mouth/chin area and moves downward
+Usually involves an open/flat hand near the
+mouth or chin followed by downward movement
 toward the other hand or lower space.
 
-Use the handshape and spatial configuration.
+In a single image, examine:
 
-Do NOT classify every open hand near the
-chin as good.
+- open handshape
+- face/chin position
+- spatial relationship
 
-============================================================
-SUPPORTED CLASS 10 — BYE
-============================================================
-
-Typical ASL farewell gesture.
-
-Usually an open palm faces outward.
-
-The fingers may be in a waving/bending
-configuration.
-
-A single photograph may capture one stage
-of the waving movement.
-
-Do NOT classify every open outward palm
-as bye.
+Distinguish carefully from thank you.
 
 ============================================================
-CRITICAL CLASS DIFFERENTIATION
+CLASS 10 — BYE
+============================================================
+
+Typical ASL farewell.
+
+Usually an open hand with palm facing outward.
+
+The fingers are extended and may appear in
+a waving/bending configuration.
+
+Do not classify every open outward-facing
+palm as bye.
+
+The overall configuration should be consistent
+with a farewell gesture.
+
+============================================================
+CRITICAL CLASS DISTINCTIONS
 ============================================================
 
 HELLO vs THANK YOU
 
-Both may involve an open hand near the face.
+Both can involve an open hand near the face.
 
 HELLO:
-forehead/temple region.
+Look toward forehead/temple and greeting-like
+configuration.
 
 THANK YOU:
-chin/mouth region.
-
-Use the exact spatial position.
-
-------------------------------------------------------------
+Look toward chin/mouth and outward gesture
+configuration.
 
 PLEASE vs SORRY
 
 PLEASE:
-open/flat hand near chest.
+Open/flat hand near chest.
 
 SORRY:
-closed/A-like hand near chest.
-
-Handshape is extremely important.
-
-------------------------------------------------------------
-
-THANK YOU vs GOOD
-
-Both may involve an open hand near the
-chin/mouth.
-
-Carefully examine the hand's position
-and apparent direction.
-
-------------------------------------------------------------
-
-BYE vs HELLO
-
-Both may involve an open hand.
-
-HELLO:
-greeting configuration near forehead/temple.
-
-BYE:
-outward-facing farewell/waving configuration.
-
-------------------------------------------------------------
+Closed/A-like hand near chest.
 
 YES vs SORRY
 
-Both may use fist-like handshapes.
-
 YES:
-S-like fist configuration.
+Closed S-like hand.
 
 SORRY:
-A-like handshape associated with chest.
+A-like hand associated with chest.
 
-------------------------------------------------------------
+NO vs TWO-FINGER GESTURES
 
-NO vs I LOVE YOU
+Do not classify based only on seeing two fingers.
 
-NO:
-index + middle + thumb closing configuration.
+The thumb interaction must support NO.
 
-I LOVE YOU:
-thumb + index + pinky extended,
-middle + ring curled.
+I LOVE YOU vs OTHER THREE-FINGER GESTURES
 
-------------------------------------------------------------
+Require:
+
+thumb extended
++
+index extended
++
+pinky extended
+
+while middle and ring fingers are curled.
 
 HELP
 
-Require the characteristic relationship
-between two hands.
+Requires the relationship between two hands.
 
 ============================================================
-CAMERA MIRRORING
+CAMERA VARIATION
 ============================================================
 
-The image may be horizontally mirrored.
+Allow reasonable variation caused by:
 
-Do NOT reject a valid sign because it is
-performed with the opposite hand.
+- left/right hand
+- mirrored camera
+- wrist rotation
+- camera angle
+- distance
+- lighting
+- skin tone
+- background
+- hand size
+- perspective
+- minor finger-angle variation
 
-Left-hand and right-hand versions should
-be treated as equivalent where appropriate.
+Interpret the underlying hand configuration.
+
+Do not require pixel-perfect orientation.
+
+However, camera variation is NOT permission to guess.
 
 ============================================================
 IMAGE QUALITY
 ============================================================
 
-First determine whether the sign is
-visually recognizable.
+Return UNKNOWN if:
 
-Return UNKNOWN when:
-
-- hand is not visible
-- important fingers are cropped
+- no hand is visible
+- hand is severely cropped
+- fingers cannot be distinguished
 - image is severely blurry
-- hand is obstructed
+- hand is heavily obstructed
 - required second hand is missing
 - lighting prevents recognition
-- gesture is ambiguous
 - multiple classes are equally plausible
-- gesture does not belong to the supported classes
+- gesture is not one of the supported classes
 
 ============================================================
-CLOSED-SET DECISION PROCESS
+DECISION PROCESS
 ============================================================
 
 Internally perform:
 
 STEP 1:
-Count visible hands.
+Determine visible hand count.
 
 STEP 2:
-Identify handshape.
+Determine handshape.
 
 STEP 3:
-Identify finger configuration.
+Determine finger configuration.
 
 STEP 4:
-Identify thumb configuration.
+Determine thumb configuration.
 
 STEP 5:
-Identify palm orientation.
+Determine palm orientation.
 
 STEP 6:
-Identify hand position relative to face/chest.
+Determine body/face location.
 
 STEP 7:
-Analyze both-hand relationship when applicable.
+Analyze both-hand relationship if applicable.
 
 STEP 8:
-Compare against ALL 10 supported classes.
+Compare against ALL ten classes.
 
 STEP 9:
-Eliminate visually inconsistent classes.
+Eliminate incompatible classes.
 
 STEP 10:
 Select the strongest visually supported class.
 
 STEP 11:
-If evidence is insufficient, return UNKNOWN.
+If visual evidence is insufficient, select UNKNOWN.
+
+Do NOT choose a class merely because it is plausible.
 
 ============================================================
 ANTI-GUESSING
 ============================================================
 
-UNKNOWN is a valid answer.
+UNKNOWN is a legitimate result.
 
-Do NOT force a prediction.
+Do not force a classification.
 
-Incorrect prediction is worse than UNKNOWN.
+It is better to return UNKNOWN than an incorrect
+classification.
 
-Only return a supported class when the
-visible evidence is sufficiently strong.
+Confidence must represent visual certainty.
 
 ============================================================
 CONFIDENCE
 ============================================================
 
-Confidence must represent visual certainty.
+0.90 - 1.00
 
-0.90–1.00:
-Very strong visual match.
+Extremely clear visual match.
 
-0.80–0.89:
+0.80 - 0.89
+
 Strong visual match.
 
-0.70–0.79:
+0.70 - 0.79
+
 Reasonably strong match.
 
-0.50–0.69:
-Weak/uncertain evidence.
+0.50 - 0.69
 
-0.00–0.49:
+Weak evidence.
+
+0.00 - 0.49
+
 Very uncertain.
 
-For UNKNOWN, confidence should normally
-be below 0.70.
+For UNKNOWN, normally use confidence below 0.70.
 
-Do NOT artificially increase confidence.
+Do not artificially increase confidence.
 
 ============================================================
 FINAL OUTPUT
 ============================================================
 
 Return ONLY valid JSON.
+
+No explanation.
+
+No reasoning.
+
+No Markdown.
+
+No additional fields.
 
 Required structure:
 
@@ -748,31 +840,25 @@ good
 bye
 UNKNOWN
 
-No explanation.
-
-No Markdown.
-
-No extra fields.
-
 ============================================================
 FINAL RULE
 ============================================================
 
-CLOSED SET.
-
-10 CLASSES + UNKNOWN.
+CLASSIFY ONLY THE TEN SUPPORTED SIGNS.
 
 NEVER OUTPUT ANOTHER CLASS.
 
+NEVER INVENT A MEANING.
+
 NEVER GUESS WHEN VISUAL EVIDENCE IS INSUFFICIENT.
 
-CLASSIFY THE COMPLETE VISIBLE GESTURE.
+RETURN ONE CLASS OR UNKNOWN.
 
 """
 
 
 # ============================================================
-# IMAGE TYPES
+# IMAGE MIME TYPES
 # ============================================================
 
 SUPPORTED_MIME_TYPES = {
@@ -788,11 +874,12 @@ SUPPORTED_MIME_TYPES = {
     "image/heic": "image/heic",
 
     "image/heif": "image/heif"
+
 }
 
 
 # ============================================================
-# NORMALIZE + VALIDATE PREDICTION
+# NORMALIZE GEMINI PREDICTION
 # ============================================================
 
 def normalize_prediction(
@@ -800,7 +887,10 @@ def normalize_prediction(
     confidence
 ):
 
-    if not isinstance(prediction, str):
+    if not isinstance(
+        prediction,
+        str
+    ):
 
         return None, 0.0
 
@@ -808,7 +898,9 @@ def normalize_prediction(
 
     try:
 
-        score = float(confidence)
+        score = float(
+            confidence
+        )
 
     except Exception:
 
@@ -822,13 +914,11 @@ def normalize_prediction(
         )
     )
 
-    normalized = prediction.lower()
-
     normalized = re.sub(
         r"\s+",
         " ",
-        normalized
-    )
+        prediction.lower()
+    ).strip()
 
     # --------------------------------------------------------
     # UNKNOWN
@@ -841,31 +931,24 @@ def normalize_prediction(
         "unable to determine",
         "not recognizable",
         "unrecognizable",
-        "none"
+        "none",
+        ""
     }:
 
         return None, score
 
     # --------------------------------------------------------
-    # HARD CLOSED-SET VALIDATION
+    # STRICT CLOSED-SET VALIDATION
     # --------------------------------------------------------
 
-    if normalized not in SUPPORTED_CLASSES:
+    if normalized not in SUPPORTED_CLASSES_SET:
 
         print(
-            "REJECTED INVALID GEMINI CLASS:",
-            repr(normalized)
+            "REJECTED GEMINI OUTPUT:",
+            repr(prediction)
         )
 
         return None, 0.0
-
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    if score < CONFIDENCE_THRESHOLD:
-
-        return None, score
 
     return normalized, score
 
@@ -897,20 +980,21 @@ async def recognize_sign(
 
     try:
 
-        # ----------------------------------------------------
-        # IMAGE
-        # ----------------------------------------------------
+        # ====================================================
+        # CREATE IMAGE PART
+        # ====================================================
 
         image_part = types.Part.from_bytes(
 
             data=image_bytes,
 
             mime_type=mime_type
+
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # GEMINI REQUEST
-        # ----------------------------------------------------
+        # ====================================================
 
         response = await asyncio.to_thread(
 
@@ -932,16 +1016,18 @@ async def recognize_sign(
                 max_output_tokens=100,
 
                 temperature=0.0
+
             )
+
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # RAW RESPONSE
-        # ----------------------------------------------------
+        # ====================================================
 
         print()
         print("-" * 70)
-        print("GEMINI RESPONSE")
+        print("GEMINI 10-CLASS PREDICTION")
         print("-" * 70)
 
         raw_text = getattr(
@@ -951,13 +1037,13 @@ async def recognize_sign(
         ) or ""
 
         print(
-            "Raw Gemini response:",
+            "Gemini raw response:",
             repr(raw_text)
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # STRUCTURED RESPONSE
-        # ----------------------------------------------------
+        # ====================================================
 
         parsed = getattr(
             response,
@@ -979,6 +1065,11 @@ async def recognize_sign(
                 0.0
             )
 
+            word, score = normalize_prediction(
+                prediction,
+                confidence
+            )
+
             print(
                 "Gemini prediction:",
                 prediction
@@ -986,20 +1077,31 @@ async def recognize_sign(
 
             print(
                 "Gemini confidence:",
-                confidence
+                score
             )
 
-            word, score = normalize_prediction(
-                prediction,
-                confidence
-            )
+            # =================================================
+            # INVALID / UNKNOWN
+            # =================================================
 
             if word is None:
 
                 return (
                     None,
                     score,
-                    "Unknown or low-confidence sign"
+                    "Sign not confidently recognized"
+                )
+
+            # =================================================
+            # CONFIDENCE THRESHOLD
+            # =================================================
+
+            if score < CONFIDENCE_THRESHOLD:
+
+                return (
+                    None,
+                    score,
+                    "Low confidence"
                 )
 
             return (
@@ -1008,9 +1110,9 @@ async def recognize_sign(
                 "Prediction successful"
             )
 
-        # ----------------------------------------------------
-        # FALLBACK JSON
-        # ----------------------------------------------------
+        # ====================================================
+        # FALLBACK JSON PARSING
+        # ====================================================
 
         if raw_text:
 
@@ -1029,6 +1131,11 @@ async def recognize_sign(
                     0.0
                 )
 
+                word, score = normalize_prediction(
+                    prediction,
+                    confidence
+                )
+
                 print(
                     "Fallback prediction:",
                     prediction
@@ -1036,12 +1143,7 @@ async def recognize_sign(
 
                 print(
                     "Fallback confidence:",
-                    confidence
-                )
-
-                word, score = normalize_prediction(
-                    prediction,
-                    confidence
+                    score
                 )
 
                 if word is None:
@@ -1049,7 +1151,15 @@ async def recognize_sign(
                     return (
                         None,
                         score,
-                        "Unknown or low-confidence sign"
+                        "Sign not confidently recognized"
+                    )
+
+                if score < CONFIDENCE_THRESHOLD:
+
+                    return (
+                        None,
+                        score,
+                        "Low confidence"
                     )
 
                 return (
@@ -1125,9 +1235,7 @@ async def root():
             "10-class closed-set",
 
         "supported_classes":
-            sorted(
-                list(SUPPORTED_CLASSES)
-            ),
+            SUPPORTED_CLASSES,
 
         "fixed_vocabulary":
             True
@@ -1165,9 +1273,7 @@ async def health():
             "10-class closed-set",
 
         "supported_classes":
-            sorted(
-                list(SUPPORTED_CLASSES)
-            ),
+            SUPPORTED_CLASSES,
 
         "fixed_vocabulary":
             True,
@@ -1193,13 +1299,13 @@ async def predict_sign(
 
     print()
     print("=" * 70)
-    print("NEW SIGN PREDICTION REQUEST")
+    print("NEW 10-CLASS SIGN REQUEST")
     print("=" * 70)
 
     try:
 
         # ====================================================
-        # GEMINI CHECK
+        # 1. GEMINI CHECK
         # ====================================================
 
         if not GEMINI_READY:
@@ -1216,54 +1322,36 @@ async def predict_sign(
 
                     "status":
                         "Gemini model not ready"
+
                 }
+
             )
 
         # ====================================================
-        # MIME TYPE
-        # ====================================================
-
-        content_type = (
-            file.content_type or ""
-        ).lower()
-
-        print(
-            "Received MIME type:",
-            content_type
-        )
-
-        if content_type not in SUPPORTED_MIME_TYPES:
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-
-                    "prediction": "",
-
-                    "confidence": 0.0,
-
-                    "status":
-                        "Unsupported image type"
-                }
-            )
-
-        mime_type = SUPPORTED_MIME_TYPES[
-            content_type
-        ]
-
-        # ====================================================
-        # READ IMAGE
+        # 2. READ IMAGE
         # ====================================================
 
         image_bytes = await file.read()
+
+        print(
+            "Received filename:",
+            file.filename
+        )
+
+        print(
+            "Received MIME type:",
+            file.content_type
+        )
 
         print(
             "Image size:",
             len(image_bytes),
             "bytes"
         )
+
+        # ====================================================
+        # 3. EMPTY IMAGE
+        # ====================================================
 
         if not image_bytes:
 
@@ -1279,11 +1367,13 @@ async def predict_sign(
 
                     "status":
                         "Empty image"
+
                 }
+
             )
 
         # ====================================================
-        # IMAGE SIZE
+        # 4. SIZE CHECK
         # ====================================================
 
         if len(image_bytes) > MAX_IMAGE_BYTES:
@@ -1300,11 +1390,59 @@ async def predict_sign(
 
                     "status":
                         "Image too large"
+
                 }
+
             )
 
         # ====================================================
-        # GEMINI
+        # 5. MIME HANDLING
+        # ====================================================
+        #
+        # Flutter explicitly sends image/jpeg.
+        #
+        # However, Android/device implementations can
+        # occasionally report:
+        #
+        # application/octet-stream
+        # empty MIME
+        # image/jpg
+        #
+        # We therefore do NOT reject the image merely
+        # because its MIME metadata is unusual.
+        #
+        # ====================================================
+
+        received_mime = (
+            file.content_type or ""
+        ).lower().strip()
+
+        if received_mime in SUPPORTED_MIME_TYPES:
+
+            mime_type = SUPPORTED_MIME_TYPES[
+                received_mime
+            ]
+
+        else:
+
+            print(
+                "Unrecognized MIME type:",
+                repr(received_mime)
+            )
+
+            print(
+                "Falling back to image/jpeg"
+            )
+
+            mime_type = "image/jpeg"
+
+        print(
+            "MIME type sent to Gemini:",
+            mime_type
+        )
+
+        # ====================================================
+        # 6. GEMINI
         # ====================================================
 
         (
@@ -1316,16 +1454,17 @@ async def predict_sign(
             image_bytes,
 
             mime_type
+
         )
 
         # ====================================================
-        # NO ACCEPTED PREDICTION
+        # 7. NO ACCEPTED PREDICTION
         # ====================================================
 
         if word is None:
 
             print(
-                "FINAL PREDICTION: UNKNOWN"
+                "No accepted prediction."
             )
 
             print(
@@ -1343,7 +1482,7 @@ async def predict_sign(
             return {
 
                 "prediction":
-                    "UNKNOWN",
+                    "",
 
                 "confidence":
                     round(
@@ -1353,10 +1492,35 @@ async def predict_sign(
 
                 "status":
                     status
+
             }
 
         # ====================================================
-        # SUCCESS
+        # 8. FINAL SAFETY CHECK
+        # ====================================================
+
+        if word not in SUPPORTED_CLASSES_SET:
+
+            print(
+                "FINAL SAFETY CHECK FAILED:",
+                word
+            )
+
+            return {
+
+                "prediction":
+                    "",
+
+                "confidence":
+                    0.0,
+
+                "status":
+                    "Invalid classification"
+
+            }
+
+        # ====================================================
+        # 9. SUCCESS
         # ====================================================
 
         print(
@@ -1389,8 +1553,8 @@ async def predict_sign(
 
             "status":
                 "Prediction successful"
-        }
 
+        }
 
     except Exception as error:
 
@@ -1412,7 +1576,7 @@ async def predict_sign(
             content={
 
                 "prediction":
-                    "UNKNOWN",
+                    "",
 
                 "confidence":
                     0.0,
@@ -1422,7 +1586,9 @@ async def predict_sign(
 
                 "error":
                     str(error)
+
             }
+
         )
 
 
