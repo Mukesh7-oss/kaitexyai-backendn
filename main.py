@@ -29,9 +29,6 @@
 #   good
 #   bye
 #
-# NO PyTorch
-# NO MediaPipe
-# NO .pt MODEL
 # ============================================================
 
 import asyncio
@@ -55,7 +52,8 @@ from google.genai import types
 # ============================================================
 
 APP_NAME = "Kaitexy AI Gemini 10-Class Backend"
-APP_VERSION = "10.1-GEMINI-10CLASS"
+
+APP_VERSION = "10.2-GEMINI-10CLASS-FIXED"
 
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
@@ -91,7 +89,7 @@ SUPPORTED_CLASSES = {
     "i love you",
     "help",
     "good",
-    "bye"
+    "bye",
 }
 
 
@@ -100,6 +98,7 @@ SUPPORTED_CLASSES = {
 # ============================================================
 
 gemini_client: Optional[genai.Client] = None
+
 GEMINI_READY = False
 
 
@@ -126,7 +125,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 
@@ -146,7 +145,9 @@ def initialize_gemini() -> bool:
 
     if not GEMINI_API_KEY:
 
-        print("ERROR: GEMINI_API_KEY is not configured.")
+        print(
+            "ERROR: GEMINI_API_KEY is not configured."
+        )
 
         gemini_client = None
         GEMINI_READY = False
@@ -161,13 +162,25 @@ def initialize_gemini() -> bool:
 
         GEMINI_READY = True
 
-        print("Gemini initialized successfully.")
-        print(f"Gemini model: {GEMINI_MODEL}")
+        print(
+            "Gemini initialized successfully."
+        )
 
-        print("Supported classes:")
+        print(
+            f"Gemini model: {GEMINI_MODEL}"
+        )
 
-        for item in sorted(SUPPORTED_CLASSES):
-            print(f"  - {item}")
+        print(
+            "Supported classes:"
+        )
+
+        for item in sorted(
+            SUPPORTED_CLASSES
+        ):
+
+            print(
+                f"  - {item}"
+            )
 
         print("=" * 70)
 
@@ -175,8 +188,13 @@ def initialize_gemini() -> bool:
 
     except Exception as error:
 
-        print("Gemini initialization failed:")
-        print(repr(error))
+        print(
+            "Gemini initialization failed:"
+        )
+
+        print(
+            repr(error)
+        )
 
         gemini_client = None
         GEMINI_READY = False
@@ -199,9 +217,20 @@ async def startup_event():
     initialize_gemini()
 
     if GEMINI_READY:
-        print("STATUS: GEMINI READY")
+
+        print(
+            "STATUS: GEMINI READY"
+        )
+
     else:
-        print("STATUS: GEMINI NOT READY")
+
+        print(
+            "STATUS: GEMINI NOT READY"
+        )
+
+    print(
+        f"MODEL: {GEMINI_MODEL}"
+    )
 
     print("=" * 70)
     print()
@@ -217,7 +246,9 @@ async def shutdown_event():
     global gemini_client
     global GEMINI_READY
 
-    print("Shutting down Kaitexy AI...")
+    print(
+        "Shutting down Kaitexy AI..."
+    )
 
     gemini_client = None
     GEMINI_READY = False
@@ -230,6 +261,7 @@ async def shutdown_event():
 class SignResult(BaseModel):
 
     prediction: str
+
     confidence: float
 
 
@@ -246,8 +278,6 @@ classification engine.
 You are NOT a conversational assistant.
 
 You are NOT an image captioning system.
-
-You are NOT allowed to generate arbitrary words.
 
 Your ONLY task is closed-set visual classification.
 
@@ -294,7 +324,7 @@ IMPORTANT
 
 This is a SINGLE IMAGE classification task.
 
-You must classify the visible hand configuration.
+Classify ONLY the visible hand configuration.
 
 Do not rely on:
 
@@ -325,8 +355,8 @@ Consider:
 5. Palm orientation.
 6. Wrist orientation.
 7. Hand orientation.
-8. Hand position relative to the face.
-9. Hand position relative to the chest.
+8. Hand position relative to face.
+9. Hand position relative to chest.
 10. Relationship between both hands.
 11. Contact between hands.
 12. Contact with face or chest.
@@ -342,7 +372,7 @@ CLASS DEFINITIONS
 
 HELLO:
 
-Typically an open hand near the forehead/temple,
+Typically an open hand near the forehead or temple,
 associated with a greeting/salute-like configuration.
 
 Look for an open hand and location near the forehead.
@@ -353,8 +383,8 @@ Do not classify every open hand near the face as hello.
 
 PLEASE:
 
-Typically an open/flat hand positioned against or
-near the upper chest.
+Typically an open or flat hand positioned against
+or near the upper chest.
 
 The characteristic configuration is associated with
 the ASL "please" sign.
@@ -375,11 +405,11 @@ Do not classify every fist as yes.
 
 THANK YOU:
 
-Typically an open/flat hand beginning near the chin
+Typically an open or flat hand beginning near the chin
 or mouth and moving outward.
 
 In one image, examine the characteristic hand position
-near the chin/mouth.
+near the chin or mouth.
 
 Do not classify every hand near the face as thank you.
 
@@ -399,9 +429,9 @@ Do not classify every fist near the chest as sorry.
 NO:
 
 Typically the index and middle fingers interact with
-the thumb in a closing/pinching configuration.
+the thumb in a closing or pinching configuration.
 
-The complete three-part configuration matters.
+The complete configuration matters.
 
 Do not classify an arbitrary two-finger gesture as no.
 
@@ -459,13 +489,13 @@ SIMILAR CLASS DISAMBIGUATION
 
 HELLO vs THANK YOU:
 
-Look at exact location.
-
 Hello:
 forehead/temple region.
 
 Thank you:
 chin/mouth region.
+
+------------------------------------------------------------
 
 PLEASE vs SORRY:
 
@@ -475,30 +505,42 @@ open/flat hand.
 Sorry:
 closed/A-like hand.
 
+------------------------------------------------------------
+
 YES vs SORRY:
 
 Both can appear fist-like.
 
 Use both handshape and body location.
 
+------------------------------------------------------------
+
 NO:
 
 Require the characteristic index/middle/thumb interaction.
+
+------------------------------------------------------------
 
 I LOVE YOU:
 
 Require thumb + index + pinky extended while
 middle + ring are curled.
 
+------------------------------------------------------------
+
 HELP:
 
 Require evidence of the two-hand relationship.
+
+------------------------------------------------------------
 
 GOOD vs THANK YOU:
 
 Both can involve the face/chin region.
 
-Use the spatial configuration and visible orientation.
+Use spatial configuration and visible orientation.
+
+------------------------------------------------------------
 
 BYE vs HELLO:
 
@@ -534,15 +576,15 @@ UNKNOWN RULE
 Return UNKNOWN if:
 
 - no hand is visible
-- the hand is severely cropped
+- hand is severely cropped
 - fingers cannot be distinguished
 - image is severely blurred
 - hand is obstructed
 - required second hand is missing
-- the configuration is ambiguous
+- configuration is ambiguous
 - multiple classes are equally plausible
 - it is an ordinary gesture
-- there is insufficient visual evidence
+- insufficient visual evidence exists
 
 Do NOT guess.
 
@@ -572,7 +614,7 @@ Do not choose a class merely because it is plausible.
 CONFIDENCE
 ============================================================
 
-Confidence is visual certainty.
+Confidence represents visual certainty.
 
 0.90 - 1.00:
 Very strong visual match.
@@ -584,7 +626,7 @@ Strong visual match.
 Reasonably strong match.
 
 0.50 - 0.69:
-Weak/ambiguous.
+Weak or ambiguous.
 
 0.00 - 0.49:
 Very uncertain.
@@ -597,7 +639,7 @@ Never artificially increase confidence.
 OUTPUT
 ============================================================
 
-Return ONLY JSON.
+Return ONLY a JSON object.
 
 Exactly these two fields:
 
@@ -612,7 +654,7 @@ No Markdown.
 
 No additional fields.
 
-prediction MUST be exactly:
+prediction MUST be exactly one of:
 
 hello
 please
@@ -645,12 +687,18 @@ WHEN UNCERTAIN, RETURN UNKNOWN.
 # ============================================================
 
 SUPPORTED_MIME_TYPES = {
+
     "image/jpeg": "image/jpeg",
+
     "image/jpg": "image/jpeg",
+
     "image/png": "image/png",
+
     "image/webp": "image/webp",
+
     "image/heic": "image/heic",
-    "image/heif": "image/heif"
+
+    "image/heif": "image/heif",
 }
 
 
@@ -658,17 +706,24 @@ SUPPORTED_MIME_TYPES = {
 # NORMALIZE MIME TYPE
 # ============================================================
 
-def normalize_mime_type(content_type: str) -> Optional[str]:
+def normalize_mime_type(
+    content_type: str
+) -> Optional[str]:
 
     if not content_type:
         return None
 
-    content_type = content_type.lower().strip()
+    content_type = (
+        content_type
+        .lower()
+        .strip()
+    )
 
-    # Remove parameters such as:
-    # image/jpeg; charset=utf-8
-
-    content_type = content_type.split(";")[0].strip()
+    content_type = (
+        content_type
+        .split(";")[0]
+        .strip()
+    )
 
     return SUPPORTED_MIME_TYPES.get(
         content_type
@@ -681,17 +736,29 @@ def normalize_mime_type(content_type: str) -> Optional[str]:
 
 def normalize_prediction(
     prediction,
-    confidence
+    confidence,
 ):
 
-    if not isinstance(prediction, str):
+    if not isinstance(
+        prediction,
+        str
+    ):
+
         return None, 0.0
 
-    prediction = prediction.strip()
+    prediction = (
+        prediction
+        .strip()
+    )
 
     try:
-        score = float(confidence)
+
+        score = float(
+            confidence
+        )
+
     except Exception:
+
         score = 0.0
 
     score = max(
@@ -702,24 +769,29 @@ def normalize_prediction(
         )
     )
 
-    # Normalize spacing/case
-
     prediction = re.sub(
         r"\s+",
         " ",
         prediction
     ).strip().lower()
 
-    # Exact UNKNOWN handling
+    # ========================================================
+    # UNKNOWN
+    # ========================================================
 
     if prediction == "unknown":
+
         return None, score
 
-    # Exact closed-set validation
+    # ========================================================
+    # CLOSED SET
+    # ========================================================
 
     if prediction not in SUPPORTED_CLASSES:
+
         print(
-            f"REJECTED GEMINI CLASS: {prediction}"
+            f"REJECTED GEMINI CLASS: "
+            f"{prediction}"
         )
 
         return None, score
@@ -728,39 +800,262 @@ def normalize_prediction(
 
 
 # ============================================================
-# PARSE GEMINI JSON
+# EXTRACT RESPONSE DATA
+# ============================================================
+
+def extract_prediction_from_object(
+    parsed
+):
+
+    prediction = None
+
+    confidence = 0.0
+
+    # --------------------------------------------------------
+    # Pydantic object
+    # --------------------------------------------------------
+
+    if hasattr(
+        parsed,
+        "prediction"
+    ):
+
+        prediction = getattr(
+            parsed,
+            "prediction",
+            None
+        )
+
+        confidence = getattr(
+            parsed,
+            "confidence",
+            0.0
+        )
+
+        return prediction, confidence
+
+    # --------------------------------------------------------
+    # Dictionary
+    # --------------------------------------------------------
+
+    if isinstance(
+        parsed,
+        dict
+    ):
+
+        prediction = parsed.get(
+            "prediction"
+        )
+
+        confidence = parsed.get(
+            "confidence",
+            0.0
+        )
+
+        return prediction, confidence
+
+    # --------------------------------------------------------
+    # String
+    # --------------------------------------------------------
+
+    if isinstance(
+        parsed,
+        str
+    ):
+
+        try:
+
+            data = json.loads(
+                parsed
+            )
+
+            if isinstance(
+                data,
+                dict
+            ):
+
+                prediction = data.get(
+                    "prediction"
+                )
+
+                confidence = data.get(
+                    "confidence",
+                    0.0
+                )
+
+                return (
+                    prediction,
+                    confidence
+                )
+
+        except Exception:
+
+            pass
+
+    return None, 0.0
+
+
+# ============================================================
+# PARSE GEMINI RESPONSE
 # ============================================================
 
 def parse_gemini_response(
     response
 ):
 
-    raw_text = getattr(
-        response,
-        "text",
-        None
-    )
-
     print()
     print("-" * 70)
     print("GEMINI RESPONSE")
     print("-" * 70)
+
+    # ========================================================
+    # METHOD 1
+    # GEMINI STRUCTURED PARSED RESPONSE
+    # ========================================================
+
+    try:
+
+        parsed = getattr(
+            response,
+            "parsed",
+            None
+        )
+
+    except Exception as error:
+
+        print(
+            "Could not access response.parsed:"
+        )
+
+        print(
+            repr(error)
+        )
+
+        parsed = None
+
+
+    print(
+        "Parsed object:",
+        repr(parsed)
+    )
+
+
+    if parsed is not None:
+
+        try:
+
+            prediction, confidence = (
+                extract_prediction_from_object(
+                    parsed
+                )
+            )
+
+            print(
+                "Parsed prediction:",
+                repr(prediction)
+            )
+
+            print(
+                "Parsed confidence:",
+                repr(confidence)
+            )
+
+            word, score = (
+                normalize_prediction(
+                    prediction,
+                    confidence
+                )
+            )
+
+            if word is None:
+
+                return (
+                    None,
+                    score,
+                    "Sign not confidently recognized"
+                )
+
+            if score < CONFIDENCE_THRESHOLD:
+
+                print(
+                    "Prediction rejected because "
+                    "confidence is below threshold."
+                )
+
+                return (
+                    None,
+                    score,
+                    "Low confidence"
+                )
+
+            return (
+                word,
+                score,
+                "Prediction successful"
+            )
+
+        except Exception as error:
+
+            print(
+                "Structured response parsing failed:"
+            )
+
+            print(
+                repr(error)
+            )
+
+
+    # ========================================================
+    # METHOD 2
+    # RESPONSE TEXT
+    # ========================================================
+
+    try:
+
+        raw_text = getattr(
+            response,
+            "text",
+            None
+        )
+
+    except Exception as error:
+
+        print(
+            "Could not access response.text:"
+        )
+
+        print(
+            repr(error)
+        )
+
+        raw_text = None
+
 
     print(
         "Raw response:",
         repr(raw_text)
     )
 
+
     if not raw_text:
-        print("Gemini returned empty text.")
 
-        return None, 0.0, "Empty Gemini response"
+        print(
+            "Gemini returned empty text."
+        )
 
-    # --------------------------------------------------------
-    # Remove accidental markdown fences
-    # --------------------------------------------------------
+        return (
+            None,
+            0.0,
+            "Empty Gemini response"
+        )
+
 
     cleaned = raw_text.strip()
+
+
+    # ========================================================
+    # REMOVE MARKDOWN FENCES
+    # ========================================================
 
     cleaned = re.sub(
         r"^```json\s*",
@@ -783,14 +1078,18 @@ def parse_gemini_response(
 
     cleaned = cleaned.strip()
 
+
     print(
         "Cleaned response:",
         repr(cleaned)
     )
 
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
+
+    # ========================================================
+    # DIRECT JSON
+    # ========================================================
+
+    data = None
 
     try:
 
@@ -798,14 +1097,26 @@ def parse_gemini_response(
             cleaned
         )
 
+        print(
+            "Direct JSON parsing succeeded."
+        )
+
     except Exception as error:
 
         print(
-            "JSON parse failed:",
+            "Direct JSON parsing failed:"
+        )
+
+        print(
             repr(error)
         )
 
-        # Try extracting the JSON object
+
+    # ========================================================
+    # EXTRACT JSON OBJECT
+    # ========================================================
+
+    if data is None:
 
         match = re.search(
             r"\{.*\}",
@@ -813,36 +1124,61 @@ def parse_gemini_response(
             flags=re.DOTALL
         )
 
-        if not match:
+        if match:
 
-            return (
-                None,
-                0.0,
-                "Invalid Gemini response"
-            )
-
-        try:
-
-            data = json.loads(
+            json_text = (
                 match.group(0)
             )
 
-        except Exception as second_error:
-
             print(
-                "JSON extraction failed:",
-                repr(second_error)
+                "Extracted JSON:",
+                repr(json_text)
             )
 
-            return (
-                None,
-                0.0,
-                "Invalid Gemini response"
-            )
+            try:
 
-    # --------------------------------------------------------
-    # Extract fields
-    # --------------------------------------------------------
+                data = json.loads(
+                    json_text
+                )
+
+                print(
+                    "Extracted JSON parsing succeeded."
+                )
+
+            except Exception as error:
+
+                print(
+                    "Extracted JSON parsing failed:"
+                )
+
+                print(
+                    repr(error)
+                )
+
+
+    # ========================================================
+    # FINAL FAILURE
+    # ========================================================
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        print(
+            "Gemini response could not be parsed."
+        )
+
+        return (
+            None,
+            0.0,
+            "Invalid Gemini response"
+        )
+
+
+    # ========================================================
+    # EXTRACT FIELDS
+    # ========================================================
 
     prediction = data.get(
         "prediction"
@@ -852,6 +1188,7 @@ def parse_gemini_response(
         "confidence",
         0.0
     )
+
 
     print(
         "Gemini prediction:",
@@ -863,18 +1200,20 @@ def parse_gemini_response(
         repr(confidence)
     )
 
-    # --------------------------------------------------------
-    # Normalize
-    # --------------------------------------------------------
+
+    # ========================================================
+    # NORMALIZE
+    # ========================================================
 
     word, score = normalize_prediction(
         prediction,
         confidence
     )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # UNKNOWN
-    # --------------------------------------------------------
+    # ========================================================
 
     if word is None:
 
@@ -884,15 +1223,16 @@ def parse_gemini_response(
             "Sign not confidently recognized"
         )
 
-    # --------------------------------------------------------
-    # Threshold
-    # --------------------------------------------------------
+
+    # ========================================================
+    # CONFIDENCE THRESHOLD
+    # ========================================================
 
     if score < CONFIDENCE_THRESHOLD:
 
         print(
-            "Prediction rejected because confidence "
-            "is below threshold."
+            "Prediction rejected because "
+            "confidence is below threshold."
         )
 
         return (
@@ -900,6 +1240,11 @@ def parse_gemini_response(
             score,
             "Low confidence"
         )
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
 
     return (
         word,
@@ -914,7 +1259,7 @@ def parse_gemini_response(
 
 async def recognize_sign(
     image_bytes: bytes,
-    mime_type: str
+    mime_type: str,
 ):
 
     if not GEMINI_READY:
@@ -925,6 +1270,7 @@ async def recognize_sign(
             "Gemini model not ready"
         )
 
+
     if gemini_client is None:
 
         return (
@@ -932,6 +1278,7 @@ async def recognize_sign(
             0.0,
             "Gemini client unavailable"
         )
+
 
     try:
 
@@ -950,18 +1297,27 @@ async def recognize_sign(
             mime_type
         )
 
-        # ----------------------------------------------------
-        # IMAGE PART
-        # ----------------------------------------------------
-
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type=mime_type
+        print(
+            "Gemini model:",
+            GEMINI_MODEL
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
+        # IMAGE PART
+        # ====================================================
+
+        image_part = (
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=mime_type
+            )
+        )
+
+
+        # ====================================================
         # GEMINI REQUEST
-        # ----------------------------------------------------
+        # ====================================================
 
         response = await asyncio.to_thread(
 
@@ -976,31 +1332,38 @@ async def recognize_sign(
 
             config=types.GenerateContentConfig(
 
-                response_mime_type="application/json",
+                response_mime_type=
+                    "application/json",
 
-                response_schema=SignResult,
+                response_schema=
+                    SignResult,
 
                 temperature=0.0,
 
-                max_output_tokens=100
-            )
+                max_output_tokens=100,
+            ),
         )
+
 
         print(
             "Gemini request completed."
         )
 
-        # ----------------------------------------------------
-        # PARSE RESPONSE TEXT
-        # ----------------------------------------------------
+
+        # ====================================================
+        # PARSE RESPONSE
+        # ====================================================
 
         result = parse_gemini_response(
             response
         )
 
+
         print("=" * 70)
 
+
         return result
+
 
     except Exception as error:
 
@@ -1010,10 +1373,12 @@ async def recognize_sign(
         print("=" * 70)
 
         print(
+            "Exception:",
             repr(error)
         )
 
         print("=" * 70)
+
 
         return (
             None,
@@ -1061,7 +1426,7 @@ async def root():
             ),
 
         "fixed_vocabulary":
-            True
+            True,
     }
 
 
@@ -1109,7 +1474,7 @@ async def health():
         "max_image_size_mb":
             MAX_IMAGE_BYTES / (
                 1024 * 1024
-            )
+            ),
     }
 
 
@@ -1127,6 +1492,7 @@ async def predict_sign(
     print("NEW SIGN PREDICTION REQUEST")
     print("=" * 70)
 
+
     try:
 
         # ====================================================
@@ -1141,33 +1507,52 @@ async def predict_sign(
 
                 content={
 
-                    "prediction": "",
+                    "prediction":
+                        "",
 
-                    "confidence": 0.0,
+                    "confidence":
+                        0.0,
 
                     "status":
-                        "Gemini model not ready"
-                }
+                        "Gemini model not ready",
+                },
             )
 
+
         # ====================================================
-        # 2. MIME TYPE
+        # 2. FILE INFORMATION
         # ====================================================
+
+        print(
+            "Filename:",
+            file.filename
+        )
 
         original_content_type = (
             file.content_type or ""
         )
+
 
         print(
             "Received MIME:",
             original_content_type
         )
 
+
+        # ====================================================
+        # 3. NORMALIZE MIME
+        # ====================================================
+
         mime_type = normalize_mime_type(
             original_content_type
         )
 
+
         if mime_type is None:
+
+            print(
+                "Unsupported MIME type."
+            )
 
             return JSONResponse(
 
@@ -1175,31 +1560,37 @@ async def predict_sign(
 
                 content={
 
-                    "prediction": "",
+                    "prediction":
+                        "",
 
-                    "confidence": 0.0,
+                    "confidence":
+                        0.0,
 
                     "status":
-                        "Unsupported image type"
-                }
+                        "Unsupported image type",
+                },
             )
+
 
         print(
             "Normalized MIME:",
             mime_type
         )
 
+
         # ====================================================
-        # 3. READ IMAGE
+        # 4. READ IMAGE
         # ====================================================
 
         image_bytes = await file.read()
+
 
         print(
             "Image size:",
             len(image_bytes),
             "bytes"
         )
+
 
         if not image_bytes:
 
@@ -1209,17 +1600,20 @@ async def predict_sign(
 
                 content={
 
-                    "prediction": "",
+                    "prediction":
+                        "",
 
-                    "confidence": 0.0,
+                    "confidence":
+                        0.0,
 
                     "status":
-                        "Empty image"
-                }
+                        "Empty image",
+                },
             )
 
+
         # ====================================================
-        # 4. SIZE LIMIT
+        # 5. SIZE LIMIT
         # ====================================================
 
         if len(image_bytes) > MAX_IMAGE_BYTES:
@@ -1230,17 +1624,20 @@ async def predict_sign(
 
                 content={
 
-                    "prediction": "",
+                    "prediction":
+                        "",
 
-                    "confidence": 0.0,
+                    "confidence":
+                        0.0,
 
                     "status":
-                        "Image too large"
-                }
+                        "Image too large",
+                },
             )
 
+
         # ====================================================
-        # 5. GEMINI
+        # 6. GEMINI RECOGNITION
         # ====================================================
 
         (
@@ -1251,16 +1648,18 @@ async def predict_sign(
 
             image_bytes,
 
-            mime_type
+            mime_type,
         )
 
+
         # ====================================================
-        # 6. NO ACCEPTED PREDICTION
+        # 7. NO ACCEPTED PREDICTION
         # ====================================================
 
         if word is None:
 
             print()
+
             print(
                 "FINAL RESULT: UNKNOWN"
             )
@@ -1277,9 +1676,11 @@ async def predict_sign(
 
             print("=" * 70)
 
+
             return {
 
-                "prediction": "",
+                "prediction":
+                    "",
 
                 "confidence":
                     round(
@@ -1288,14 +1689,16 @@ async def predict_sign(
                     ),
 
                 "status":
-                    status
+                    status,
             }
 
+
         # ====================================================
-        # 7. FINAL SUCCESS
+        # 8. FINAL SUCCESS
         # ====================================================
 
         print()
+
         print(
             "FINAL PREDICTION:",
             word
@@ -1313,6 +1716,7 @@ async def predict_sign(
 
         print("=" * 70)
 
+
         return {
 
             "prediction":
@@ -1325,8 +1729,9 @@ async def predict_sign(
                 ),
 
             "status":
-                "Prediction successful"
+                "Prediction successful",
         }
+
 
     except Exception as error:
 
@@ -1336,10 +1741,12 @@ async def predict_sign(
         print("=" * 70)
 
         print(
+            "Exception:",
             repr(error)
         )
 
         print("=" * 70)
+
 
         return JSONResponse(
 
@@ -1347,16 +1754,18 @@ async def predict_sign(
 
             content={
 
-                "prediction": "",
+                "prediction":
+                    "",
 
-                "confidence": 0.0,
+                "confidence":
+                    0.0,
 
                 "status":
                     "Server error",
 
                 "error":
-                    str(error)
-            }
+                    str(error),
+            },
         )
 
 
